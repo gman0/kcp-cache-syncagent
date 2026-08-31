@@ -1,0 +1,53 @@
+name: Documentation
+
+on:
+  # So we can trigger manually if needed
+  workflow_dispatch:
+  # To confirm any changes to docs build successfully, without deploying them
+  pull_request:
+  # Pushes to branches do the full build + deployment
+  push:
+    branches:
+      - main
+      - "release-*"
+    paths:
+      - "cmd/**"
+      - "docs/**"
+      - "pkg/**"
+      - ".github/workflows/docs-gen-and-push.yaml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}
+
+jobs:
+  generate-and-push:
+    name: Generate and push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # tag=v6.0.1
+
+      - run: git fetch origin gh-pages
+      - run: git fetch origin '+refs/tags/v*:refs/tags/v*' --no-tags
+
+      - name: Setup Go
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # tag=v6.1.0
+        with:
+          go-version: v1.26.4
+          cache: true
+
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 #tag=v6.1.0
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      # mike does not support giving CLI flags for mkdocs, but we also do not
+      # want to permanently enable strict mode, so here we enable it just for this
+      # task
+      - run: |
+          echo "strict: true" >> docs/mkdocs.yml
+
+      - run: make generate-api-docs deploy-docs

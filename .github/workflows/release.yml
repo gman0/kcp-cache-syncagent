@@ -1,0 +1,64 @@
+name: goreleaser
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .goreleaser.yaml
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # tag=v6.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # tag=v6.1.0
+        with:
+          go-version: v1.26.4
+          cache: true
+
+      - name: Delete non-semver tags
+        run: 'git tag -d $(git tag -l | grep -v "^v")'
+
+      - name: Set LDFLAGS
+        run: echo LDFLAGS="$(make ldflags)" >> $GITHUB_ENV
+
+      - name: Run GoReleaser on tag
+        if: github.event_name != 'pull_request'
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # tag=v6.4.0
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --timeout 60m
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run GoReleaser on pull request
+        if: github.event_name == 'pull_request'
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # tag=v6.4.0
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --timeout 60m --snapshot
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # tag=v5.0.0
+        if: github.event_name == 'pull_request'
+        with:
+          name: binaries
+          path: dist/*.tar.gz
