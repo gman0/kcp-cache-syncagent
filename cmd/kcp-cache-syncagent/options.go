@@ -19,6 +19,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/spf13/pflag"
 
@@ -30,11 +31,12 @@ import (
 )
 
 type Options struct {
-	KcpCacheTLSCa  string
-	KcpCacheTLSKey string
-	KcpCacheName   string
+	TlsCA   string
+	TlsCert string
+	TlsKey  string
 
-	KcpRootShardKubeconfig string
+	SourceURL       string
+	InitialPeerURLs []string
 
 	// NB: Not actually defined here, as ctrl-runtime registers its
 	// own --kubeconfig flag that is required to make its GetConfigOrDie()
@@ -83,7 +85,11 @@ func NewOptions() *Options {
 func (o *Options) AddFlags(flags *pflag.FlagSet) {
 	o.LogOptions.AddPFlags(flags)
 
-	flags.StringVar(&o.KcpRootShardKubeconfig, "kcp-root-shard-kubeconfig", o.KcpRootShardKubeconfig, "root shard kubeconfig")
+	flags.StringVar(&o.TlsCA, "tls-ca", o.TlsCA, "cache-server TLS CA")
+	flags.StringVar(&o.TlsCA, "tls-cert", o.TlsCert, "cache-server TLS certificate")
+	flags.StringVar(&o.TlsCA, "tls-key", o.TlsKey, "cache-server TLS key")
+	flags.StringVar(&o.SourceURL, "source-url", o.SourceURL, "source cache-server URL")
+	flags.StringSliceVar(&o.InitialPeerURLs, "initial-peer-urls", o.InitialPeerURLs, "initial cache-server peers to sync-out")
 	flags.StringVar(&o.Namespace, "namespace", o.Namespace, "Kubernetes namespace the Sync Agent is running in")
 	flags.StringVar(&o.AgentName, "agent-name", o.AgentName, "name of this Sync Agent, must not be changed after the first run, can be left blank to auto-generate a name")
 	flags.BoolVar(&o.EnableLeaderElection, "enable-leader-election", o.EnableLeaderElection, "whether to perform leader election")
@@ -108,8 +114,18 @@ func (o *Options) Validate() error {
 		}
 	}
 
-	if len(o.KcpRootShardKubeconfig) == 0 {
-		errs = append(errs, errors.New("--kcp-root-shard-kubeconfig is required"))
+	if len(o.TlsCA) == 0 {
+		errs = append(errs, errors.New("--tls-ca is required"))
+	}
+	if len(o.TlsCert) == 0 {
+		errs = append(errs, errors.New("--tls-cert is required"))
+	}
+	if len(o.TlsKey) == 0 {
+		errs = append(errs, errors.New("--tls-key is required"))
+	}
+
+	if len(o.SourceURL) == 0 {
+		errs = append(errs, errors.New("--source-url is required"))
 	}
 
 	disabled := sets.New(o.DisabledControllers...)
@@ -124,6 +140,8 @@ func (o *Options) Validate() error {
 
 func (o *Options) Complete() error {
 	errs := []error{}
+
+	slices.Compact(slices.DeleteFunc(o.InitialPeerURLs, func(s string) bool { return s == o.SourceURL }))
 
 	return utilerrors.NewAggregate(errs)
 }
