@@ -34,7 +34,9 @@ A cache-server holds the **authoritative** copy of data for a shard if that shar
 
 The cache-syncagent accepts the following flags:
 
-* `--tls-ca`, `--tls-cert`, `--tls-key` — TLS credentials used to construct client configurations for all cache-server connections. All cache-servers are expected to share the same CA, certificate, and key.
+* `--cache-client-ca-file` — CA certificate used to verify cache-server serving certificates.
+* `--cache-client-cert-file` — client certificate used to authenticate to cache-servers.
+* `--cache-client-key-file` — key for the client certificate.
 * `--source-url` — the URL of the cache-server that this syncagent watches and replicates data from.
 * `--initial-peer-urls` — comma-separated list of peer cache-server URLs used to bootstrap the peer mesh before peer Cache objects are discovered via source data. Optional; not needed in a single-cache-server installation.
 
@@ -48,7 +50,7 @@ Peer connectivity is bootstrapped and maintained as follows:
 
 **Bootstrap (one-time):** For each URL in `--initial-peer-urls`, the syncagent performs a cross-shard LIST of Cache objects on that peer (wildcard shard `*`, `system:shard` cluster). This seeds the initial peer list. Because Cache objects from other cache-servers propagate through shard data (see below), a single initial peer URL is sufficient to discover the full existing mesh transitively.
 
-**Ongoing discovery:** The syncagent maintains a cross-shard watch of Cache objects on its source. When a new Cache object appears, the syncagent reads `spec.baseURL`, constructs a client using the shared TLS credentials, and begins syncing to that peer.
+**Ongoing discovery:** The syncagent maintains a cross-shard watch of Cache objects on its source. When a new Cache object appears, the syncagent reads `spec.baseURL`, constructs a client using the `--cache-client-*` credentials, and begins syncing to that peer.
 
 **Propagation:** The cache-server writes its Cache object into `system:cache:server/system:cache`. Each connected shard pulls that object into its `system:shard` cluster during bootstrap (existing behaviour, see `@kcp/pkg/reconciler/core/cache`). Because shard data is synced across all peers by each respective syncagent, Cache objects propagate through the mesh without a dedicated reconciler — they travel as ordinary shard data.
 
@@ -86,7 +88,7 @@ On startup and on new peer discovery, the peer informer performs its initial LIS
 
 When syncing an object to a peer, the syncagent writes via the peer's Kubernetes API using the same shard-in-URL mechanism as the shard replication reconcilers:
 
-* A client is constructed from the peer's `spec.baseURL` and the shared TLS credentials.
+* A client is constructed from the peer's `spec.baseURL` and the `--cache-client-ca-file`, `--cache-client-cert-file`, `--cache-client-key-file` credentials.
 * The shard name is injected into the request URL via `WithShardNameFromContextRoundTripper`, producing the same `<Storage prefix> / <Group> / <Resource> / ... / <Shard> / <Cluster> / ...` etcd key structure on the target.
 * Create, update, and delete operations are issued via the standard Kubernetes API.
 
@@ -94,7 +96,7 @@ Because each shard is authoritative on exactly one cache-server, no write confli
 
 ### Bootstrap sequence
 
-1. Connect to the source cache-server using `--source-url` and the shared TLS flags.
+1. Connect to the source cache-server using `--source-url` and the `--cache-client-*` flags.
 2. Read the Cache object from source's `system:cache:server/system:cache` → derive own cache-server name.
 3. For each `--initial-peer-urls` entry: cross-shard LIST all Cache objects → seed initial peer list; build a client per discovered peer.
 4. Start a cross-shard watch of Cache objects on source → ongoing peer discovery; for each newly appearing Cache object whose `spec.baseURL` differs from `--source-url`, build a client and begin syncing to that peer.
@@ -123,3 +125,5 @@ An operator-run tool (e.g. a subcommand of the syncagent binary) that, given a s
 Cache-servers detect that a shard no longer exists in the mesh — no Shard object in any connected shard's data — and garbage-collect its data autonomously. Fully automatic and requires no operator action, but needs changes to the cache-server itself. Deferred to a follow-up.
 
 Both options can coexist: the dedicated tool as the near-term operational escape hatch, autonomous GC as the long-term solution.
+
+**Current decision**: neither is implemented in the initial version. Shard decommissioning is not yet in scope — the kcp-side workflow for shard removal is not ready. Revisit when kcp catches up.

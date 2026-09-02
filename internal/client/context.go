@@ -1,0 +1,59 @@
+/*
+Copyright 2026 The KCP Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package client
+
+import (
+	"context"
+
+	kshard "github.com/gman0/kcp-cache-syncagent/internal/client/shard"
+)
+
+type shardContextKey int
+type clusterContextKey int
+
+const (
+	shardKey   shardContextKey   = iota
+	clusterKey clusterContextKey = iota
+)
+
+// WithShardInContext returns a context with the given shard name set.
+func WithShardInContext(parent context.Context, s kshard.Name) context.Context {
+	return context.WithValue(parent, shardKey, s)
+}
+
+// ShardFromContext returns the shard name stored in ctx, or empty if not set.
+func ShardFromContext(ctx context.Context) kshard.Name {
+	s, ok := ctx.Value(shardKey).(kshard.Name)
+	if !ok {
+		return ""
+	}
+	return s
+}
+
+// WithClusterInContext returns a context with the given cluster name set.
+func WithClusterInContext(parent context.Context, cluster string) context.Context {
+	return context.WithValue(parent, clusterKey, cluster)
+}
+
+// ClusterFromContext returns the cluster name stored in ctx, or empty if not set.
+func ClusterFromContext(ctx context.Context) string {
+	c, ok := ctx.Value(clusterKey).(string)
+	if !ok {
+		return ""
+	}
+	return c
+}

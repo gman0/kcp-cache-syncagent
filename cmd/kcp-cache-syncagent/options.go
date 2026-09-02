@@ -18,7 +18,6 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"slices"
 
 	"github.com/spf13/pflag"
@@ -26,122 +25,105 @@ import (
 	"github.com/gman0/kcp-cache-syncagent/internal/log"
 
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/apimachinery/pkg/util/validation"
 )
 
+// Options holds all command-line options for the cache-syncagent.
 type Options struct {
-	TlsCA   string
-	TlsCert string
-	TlsKey  string
+	// CacheClientCAFile is the CA certificate used to verify cache-server
+	// serving certificates.
+	CacheClientCAFile string
 
-	SourceURL       string
+	// CacheClientCertFile is the client certificate used to authenticate
+	// to cache-servers.
+	CacheClientCertFile string
+
+	// CacheClientKeyFile is the private key for the client certificate.
+	CacheClientKeyFile string
+
+	// SourceURL is the URL of the cache-server this syncagent replicates from.
+	SourceURL string
+
+	// InitialPeerURLs is a comma-separated list of peer cache-server URLs used
+	// to bootstrap the peer mesh before peer Cache objects are discovered via
+	// the source.
 	InitialPeerURLs []string
 
-	// NB: Not actually defined here, as ctrl-runtime registers its
-	// own --kubeconfig flag that is required to make its GetConfigOrDie()
-	// work.
-	// KubeconfigFile string
+	// LeaderElectionKubeconfig is a kubeconfig for a separate Kubernetes cluster
+	// used to store leader-election leases. The cache-server is apiextensions-only
+	// and cannot serve coordination.k8s.io/v1 leases itself.
+	// If empty, leader election is disabled.
+	LeaderElectionKubeconfig string
 
-	// Namespace is the namespace that the Sync Agent runs in.
+	// Namespace is the Kubernetes namespace used for leader-election lease
+	// objects (only meaningful when LeaderElectionKubeconfig is set).
 	Namespace string
-
-	// Whether or not to perform leader election (requires permissions to
-	// manage coordination/v1 leases)
-	EnableLeaderElection bool
-
-	// AgentName can be used to give this Sync Agent instance a custom name. This name is used
-	// for the Sync Agent resource inside kcp. This value must not be changed after a Sync Agent
-	// has registered for the first time in kcp.
-	// If not given, defaults to "<service ref>-syncagent".
-	AgentName string
-
-	KubeconfigHostOverride   string
-	KubeconfigCAFileOverride string
 
 	LogOptions log.Options
 
 	MetricsAddr string
 	HealthAddr  string
-
-	DisabledControllers []string
-
-	// EnableServerSideApply switches the sync controller to use Kubernetes
-	// Server-Side Apply when writing synchronized objects to the local
-	// cluster. This preserves fields owned by other field managers (e.g.
-	// Crossplane writing spec.resourceRef onto a claim) and hopefully avoids
-	// accidentally creating duplicate composite resources.
-	EnableServerSideApply bool
 }
 
 func NewOptions() *Options {
 	return &Options{
-		LogOptions:            log.NewDefaultOptions(),
-		MetricsAddr:           "127.0.0.1:8085",
-		EnableServerSideApply: false,
+		LogOptions:  log.NewDefaultOptions(),
+		MetricsAddr: "127.0.0.1:8085",
+		HealthAddr:  "0",
 	}
 }
 
 func (o *Options) AddFlags(flags *pflag.FlagSet) {
 	o.LogOptions.AddPFlags(flags)
 
-	flags.StringVar(&o.TlsCA, "tls-ca", o.TlsCA, "cache-server TLS CA")
-	flags.StringVar(&o.TlsCA, "tls-cert", o.TlsCert, "cache-server TLS certificate")
-	flags.StringVar(&o.TlsCA, "tls-key", o.TlsKey, "cache-server TLS key")
-	flags.StringVar(&o.SourceURL, "source-url", o.SourceURL, "source cache-server URL")
-	flags.StringSliceVar(&o.InitialPeerURLs, "initial-peer-urls", o.InitialPeerURLs, "initial cache-server peers for discovery")
-	flags.StringVar(&o.Namespace, "namespace", o.Namespace, "Kubernetes namespace the Sync Agent is running in")
-	flags.StringVar(&o.AgentName, "agent-name", o.AgentName, "name of this Sync Agent, must not be changed after the first run, can be left blank to auto-generate a name")
-	flags.BoolVar(&o.EnableLeaderElection, "enable-leader-election", o.EnableLeaderElection, "whether to perform leader election")
-	flags.StringVar(&o.KubeconfigHostOverride, "kubeconfig-host-override", o.KubeconfigHostOverride, "override the host configured in the local kubeconfig")
-	flags.StringVar(&o.KubeconfigCAFileOverride, "kubeconfig-ca-file-override", o.KubeconfigCAFileOverride, "override the server CA file configured in the local kubeconfig")
-	flags.StringVar(&o.MetricsAddr, "metrics-address", o.MetricsAddr, "host and port to serve Prometheus metrics via /metrics (HTTP)")
-	flags.StringVar(&o.HealthAddr, "health-address", o.HealthAddr, "host and port to serve probes via /readyz and /healthz (HTTP)")
-	flags.StringSliceVar(&o.DisabledControllers, "disabled-controllers", o.DisabledControllers, fmt.Sprintf("comma-separated list of controllers (out of %v) to disable (can be given multiple times)", sets.List(availableControllers)))
-	flags.BoolVar(&o.EnableServerSideApply, "enable-server-side-apply", o.EnableServerSideApply, "use Kubernetes Server-Side Apply when writing synchronized objects to the local cluster (recommended; preserves fields owned by other controllers such as Crossplane's claim binder)")
+	flags.StringVar(&o.CacheClientCAFile, "cache-client-ca-file", o.CacheClientCAFile,
+		"CA certificate file used to verify cache-server serving certificates")
+	flags.StringVar(&o.CacheClientCertFile, "cache-client-cert-file", o.CacheClientCertFile,
+		"client certificate file used to authenticate to cache-servers")
+	flags.StringVar(&o.CacheClientKeyFile, "cache-client-key-file", o.CacheClientKeyFile,
+		"private key file for the client certificate")
+	flags.StringVar(&o.SourceURL, "source-url", o.SourceURL,
+		"URL of the source cache-server to replicate from")
+	flags.StringSliceVar(&o.InitialPeerURLs, "initial-peer-urls", o.InitialPeerURLs,
+		"comma-separated list of peer cache-server URLs used to bootstrap the peer mesh (optional)")
+	flags.StringVar(&o.LeaderElectionKubeconfig, "leader-election-kubeconfig", o.LeaderElectionKubeconfig,
+		"kubeconfig for a Kubernetes cluster used to store leader-election leases; if unset, leader election is disabled")
+	flags.StringVar(&o.Namespace, "namespace", o.Namespace,
+		"Kubernetes namespace for leader-election leases (only used with --leader-election-kubeconfig)")
+	flags.StringVar(&o.MetricsAddr, "metrics-address", o.MetricsAddr,
+		"host:port for Prometheus metrics via /metrics (HTTP)")
+	flags.StringVar(&o.HealthAddr, "health-address", o.HealthAddr,
+		"host:port for health probes via /readyz and /healthz (HTTP)")
 }
 
 func (o *Options) Validate() error {
-	errs := []error{}
+	var errs []error
 
 	if err := o.LogOptions.Validate(); err != nil {
 		errs = append(errs, err)
 	}
-
-	if len(o.AgentName) > 0 {
-		if e := validation.IsDNS1035Label(o.AgentName); len(e) > 0 {
-			errs = append(errs, fmt.Errorf("--agent-name is invalid: %v", e))
-		}
+	if o.CacheClientCAFile == "" {
+		errs = append(errs, errors.New("--cache-client-ca-file is required"))
 	}
-
-	if len(o.TlsCA) == 0 {
-		errs = append(errs, errors.New("--tls-ca is required"))
+	if o.CacheClientCertFile == "" {
+		errs = append(errs, errors.New("--cache-client-cert-file is required"))
 	}
-	if len(o.TlsCert) == 0 {
-		errs = append(errs, errors.New("--tls-cert is required"))
+	if o.CacheClientKeyFile == "" {
+		errs = append(errs, errors.New("--cache-client-key-file is required"))
 	}
-	if len(o.TlsKey) == 0 {
-		errs = append(errs, errors.New("--tls-key is required"))
-	}
-
-	if len(o.SourceURL) == 0 {
+	if o.SourceURL == "" {
 		errs = append(errs, errors.New("--source-url is required"))
 	}
-
-	disabled := sets.New(o.DisabledControllers...)
-	unknown := disabled.Difference(availableControllers)
-
-	if unknown.Len() > 0 {
-		errs = append(errs, fmt.Errorf("unknown controller(s) %v, mut be any of %v", sets.List(unknown), sets.List(availableControllers)))
+	if o.LeaderElectionKubeconfig != "" && o.Namespace == "" {
+		errs = append(errs, errors.New("--namespace is required when --leader-election-kubeconfig is set"))
 	}
 
 	return utilerrors.NewAggregate(errs)
 }
 
 func (o *Options) Complete() error {
-	errs := []error{}
-
-	slices.Compact(slices.DeleteFunc(o.InitialPeerURLs, func(s string) bool { return s == o.SourceURL }))
-
-	return utilerrors.NewAggregate(errs)
+	// Remove the source URL from the initial peer list if present.
+	o.InitialPeerURLs = slices.DeleteFunc(o.InitialPeerURLs, func(s string) bool {
+		return s == o.SourceURL
+	})
+	return nil
 }
