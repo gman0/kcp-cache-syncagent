@@ -89,7 +89,7 @@ func (o *Options) AddFlags(flags *pflag.FlagSet) {
 	flags.StringVar(&o.TlsCA, "tls-cert", o.TlsCert, "cache-server TLS certificate")
 	flags.StringVar(&o.TlsCA, "tls-key", o.TlsKey, "cache-server TLS key")
 	flags.StringVar(&o.SourceURL, "source-url", o.SourceURL, "source cache-server URL")
-	flags.StringSliceVar(&o.InitialPeerURLs, "initial-peer-urls", o.InitialPeerURLs, "initial cache-server peers to sync-out")
+	flags.StringSliceVar(&o.InitialPeerURLs, "initial-peer-urls", o.InitialPeerURLs, "initial cache-server peers for discovery")
 	flags.StringVar(&o.Namespace, "namespace", o.Namespace, "Kubernetes namespace the Sync Agent is running in")
 	flags.StringVar(&o.AgentName, "agent-name", o.AgentName, "name of this Sync Agent, must not be changed after the first run, can be left blank to auto-generate a name")
 	flags.BoolVar(&o.EnableLeaderElection, "enable-leader-election", o.EnableLeaderElection, "whether to perform leader election")
