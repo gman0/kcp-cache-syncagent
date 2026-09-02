@@ -20,227 +20,162 @@ package crdmanager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
-	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/gman0/kcp-cache-syncagent/internal/controller/replication"
+	shardtracker "github.com/gman0/kcp-cache-syncagent/internal/controller/shard"
 	dynmanager "github.com/gman0/kcp-cache-syncagent/internal/manager"
-	"github.com/gman0/kcp-cache-syncagent/internal/shard"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/watch"
-	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-var crdGVR = schema.GroupVersionResource{
-	Group:    "apiextensions.k8s.io",
-	Version:  "v1",
-	Resource: "customresourcedefinitions",
+// Reconciler watches CRDs and starts/stops a replication controller per type.
+type Reconciler struct {
+	// ctx is the root application context; replication controllers are tied to
+	// derived contexts so they shut down when the app shuts down.
+	ctx           context.Context
+	client        ctrlclient.Client
+	sourceManager manager.Manager
+	dmcm          *dynmanager.DynamicMultiClusterManager
+	tracker       *shardtracker.Tracker
+	log           *zap.SugaredLogger
+
+	syncCancelsLock sync.RWMutex
+	syncCancels     map[string]context.CancelCauseFunc
 }
 
-// Controller watches CRDs on the source and starts/stops a replication
-// controller per resource type.
-type Controller struct {
-	sourceConfig *rest.Config
-	dmcm         *dynmanager.DynamicMultiClusterManager
-	tracker      *shard.Tracker
-	log          *zap.SugaredLogger
-
-	mu sync.Mutex
-	// crdCount tracks how many shards report each CRD (by group/resource).
-	crdCount map[string]int
-	// crdCancels holds the cancel func for each active replication controller.
-	crdCancels map[string]context.CancelFunc
-}
-
-// New creates a CRDManager.
-func New(
-	sourceConfig *rest.Config,
+// Add creates the CRD-manager controller and registers it with sourceMgr.
+func Add(
+	ctx context.Context,
+	sourceMgr manager.Manager,
 	dmcm *dynmanager.DynamicMultiClusterManager,
-	tracker *shard.Tracker,
+	tracker *shardtracker.Tracker,
 	log *zap.SugaredLogger,
-) *Controller {
-	return &Controller{
-		sourceConfig: sourceConfig,
-		dmcm:         dmcm,
-		tracker:      tracker,
-		log:          log.Named("crd-manager"),
-		crdCount:     make(map[string]int),
-		crdCancels:   make(map[string]context.CancelFunc),
+) error {
+	r := &Reconciler{
+		ctx:           ctx,
+		client:        sourceMgr.GetClient(),
+		sourceManager: sourceMgr,
+		dmcm:          dmcm,
+		tracker:       tracker,
+		log:           log.Named("crd-manager"),
+		syncCancels:   make(map[string]context.CancelCauseFunc),
 	}
+
+	_, err := builder.ControllerManagedBy(sourceMgr).
+		Named("crd-manager").
+		For(&apiextensionsv1.CustomResourceDefinition{}).
+		Build(r)
+	return err
 }
 
-// Start implements manager.Runnable. It watches CRDs until ctx is cancelled.
-func (c *Controller) Start(ctx context.Context) error {
-	dynClient, err := dynamic.NewForConfig(c.sourceConfig)
-	if err != nil {
-		return fmt.Errorf("creating dynamic client: %w", err)
-	}
-
-	for {
-		if err := c.run(ctx, dynClient); err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			c.log.Warnw("CRD watch loop failed, retrying", zap.Error(err))
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-time.After(5 * time.Second):
-			}
-		} else {
-			return nil
+func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+	crd := &apiextensionsv1.CustomResourceDefinition{}
+	if err := r.client.Get(ctx, req.NamespacedName, crd); err != nil {
+		if apierrors.IsNotFound(err) {
+			return reconcile.Result{}, r.cleanupController(req.Name)
 		}
+		return reconcile.Result{}, err
 	}
+
+	if crd.DeletionTimestamp != nil {
+		return reconcile.Result{}, r.cleanupController(req.Name)
+	}
+
+	return reconcile.Result{}, r.ensureReplicationController(crd)
 }
 
-func (c *Controller) run(ctx context.Context, dynClient dynamic.Interface) error {
-	list, err := dynClient.Resource(crdGVR).List(ctx, metav1.ListOptions{})
+func (r *Reconciler) ensureReplicationController(crd *apiextensionsv1.CustomResourceDefinition) error {
+	key := crd.Name
+
+	r.syncCancelsLock.RLock()
+	_, exists := r.syncCancels[key]
+	r.syncCancelsLock.RUnlock()
+	if exists {
+		return nil
+	}
+
+	gvr, gvk, err := gvrAndGVKFromCRD(crd)
 	if err != nil {
-		return fmt.Errorf("listing CRDs: %w", err)
+		return fmt.Errorf("determining GVR/GVK for CRD %q: %w", crd.Name, err)
 	}
 
-	for i := range list.Items {
-		c.handleAdd(ctx, &list.Items[i])
-	}
+	ctrlCtx, ctrlCancel := context.WithCancelCause(r.ctx)
 
-	watcher, err := dynClient.Resource(crdGVR).Watch(ctx, metav1.ListOptions{
-		ResourceVersion: list.GetResourceVersion(),
-	})
+	ctrl, err := replication.Create(
+		ctrlCtx,
+		r.sourceManager,
+		r.dmcm.GetManager(),
+		gvr,
+		gvk,
+		r.tracker,
+		r.dmcm,
+		r.log,
+	)
 	if err != nil {
-		return fmt.Errorf("watching CRDs: %w", err)
+		ctrlCancel(fmt.Errorf("creating replication controller: %w", err))
+		return fmt.Errorf("creating replication controller for CRD %q: %w", crd.Name, err)
 	}
-	defer watcher.Stop()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case event, ok := <-watcher.ResultChan():
-			if !ok {
-				return fmt.Errorf("watch channel closed")
-			}
-			obj, ok := event.Object.(*unstructured.Unstructured)
-			if !ok {
-				continue
-			}
-			switch event.Type {
-			case watch.Added:
-				c.handleAdd(ctx, obj)
-			case watch.Deleted:
-				c.handleDelete(obj)
-			}
-		}
+	r.syncCancelsLock.Lock()
+	r.syncCancels[key] = ctrlCancel
+	r.syncCancelsLock.Unlock()
+
+	r.log.Infow("Starting replication controller", "crd", crd.Name, "gvr", gvr)
+	if err := r.dmcm.StartController(ctrlCtx, r.log.With("crd", crd.Name), ctrl); err != nil {
+		ctrlCancel(fmt.Errorf("starting replication controller: %w", err))
+		r.syncCancelsLock.Lock()
+		delete(r.syncCancels, key)
+		r.syncCancelsLock.Unlock()
+		return fmt.Errorf("starting replication controller for CRD %q: %w", crd.Name, err)
 	}
+
+	return nil
 }
 
-// crdKey returns a stable key for a CRD by group+resource (shared across shards).
-func crdKey(obj *unstructured.Unstructured) string {
-	group, _, _ := unstructured.NestedString(obj.Object, "spec", "group")
-	resource, _, _ := unstructured.NestedString(obj.Object, "spec", "names", "plural")
-	return group + "/" + resource
+func (r *Reconciler) cleanupController(crdName string) error {
+	r.syncCancelsLock.Lock()
+	defer r.syncCancelsLock.Unlock()
+
+	if cancel, ok := r.syncCancels[crdName]; ok {
+		r.log.Infow("Stopping replication controller", "crd", crdName)
+		cancel(errors.New("CRD deleted"))
+		delete(r.syncCancels, crdName)
+	}
+
+	return nil
 }
 
-func (c *Controller) handleAdd(ctx context.Context, obj *unstructured.Unstructured) {
-	key := crdKey(obj)
-	if key == "/" {
-		return
-	}
+func gvrAndGVKFromCRD(crd *apiextensionsv1.CustomResourceDefinition) (schema.GroupVersionResource, schema.GroupVersionKind, error) {
+	group := crd.Spec.Group
+	resource := crd.Spec.Names.Plural
+	kind := crd.Spec.Names.Kind
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.crdCount[key]++
-	if c.crdCount[key] > 1 {
-		// Already started for this CRD (appeared from another shard).
-		return
-	}
-
-	gvr, err := gvrFromCRD(obj)
-	if err != nil {
-		c.log.Warnw("Could not determine GVR for CRD", "crd", obj.GetName(), zap.Error(err))
-		return
-	}
-
-	ctrl := replication.New(gvr, c.sourceConfig, c.tracker, c.log)
-
-	ctrlCtx, cancel := context.WithCancel(ctx)
-	c.crdCancels[key] = cancel
-
-	c.log.Infow("Starting replication controller", "gvr", gvr)
-	if err := c.dmcm.StartController(ctrlCtx, c.log, ctrl); err != nil {
-		c.log.Errorw("Failed to start replication controller", "gvr", gvr, zap.Error(err))
-		cancel()
-		delete(c.crdCancels, key)
-	}
-}
-
-func (c *Controller) handleDelete(obj *unstructured.Unstructured) {
-	key := crdKey(obj)
-	if key == "/" {
-		return
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.crdCount[key]--
-	if c.crdCount[key] > 0 {
-		// Still present on other shards.
-		return
-	}
-	delete(c.crdCount, key)
-
-	if cancel, ok := c.crdCancels[key]; ok {
-		gvr, _ := gvrFromCRD(obj)
-		c.log.Infow("Stopping replication controller", "gvr", gvr)
-		cancel()
-		delete(c.crdCancels, key)
-	}
-}
-
-func gvrFromCRD(obj *unstructured.Unstructured) (schema.GroupVersionResource, error) {
-	group, found, err := unstructured.NestedString(obj.Object, "spec", "group")
-	if err != nil || !found || group == "" {
-		return schema.GroupVersionResource{}, fmt.Errorf("spec.group missing")
-	}
-
-	resource, found, err := unstructured.NestedString(obj.Object, "spec", "names", "plural")
-	if err != nil || !found || resource == "" {
-		return schema.GroupVersionResource{}, fmt.Errorf("spec.names.plural missing")
-	}
-
-	versions, found, err := unstructured.NestedSlice(obj.Object, "spec", "versions")
-	if err != nil || !found || len(versions) == 0 {
-		return schema.GroupVersionResource{}, fmt.Errorf("spec.versions missing or empty")
-	}
-
-	// Prefer the storage version; fall back to the first entry.
 	version := ""
-	for _, v := range versions {
-		vm, ok := v.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if storage, _, _ := unstructured.NestedBool(vm, "storage"); storage {
-			version, _, _ = unstructured.NestedString(vm, "name")
+	for _, v := range crd.Spec.Versions {
+		if v.Storage {
+			version = v.Name
 			break
 		}
 	}
-	if version == "" {
-		if vm, ok := versions[0].(map[string]interface{}); ok {
-			version, _, _ = unstructured.NestedString(vm, "name")
-		}
+	if version == "" && len(crd.Spec.Versions) > 0 {
+		version = crd.Spec.Versions[0].Name
 	}
 	if version == "" {
-		return schema.GroupVersionResource{}, fmt.Errorf("could not determine storage version")
+		return schema.GroupVersionResource{}, schema.GroupVersionKind{}, fmt.Errorf("no version found in CRD %q", crd.Name)
 	}
 
-	return schema.GroupVersionResource{Group: group, Version: version, Resource: resource}, nil
+	gvr := schema.GroupVersionResource{Group: group, Version: version, Resource: resource}
+	gvk := schema.GroupVersionKind{Group: group, Version: version, Kind: kind}
+	return gvr, gvk, nil
 }

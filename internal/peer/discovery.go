@@ -14,53 +14,31 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package discovery provides the peer cache-server discovery provider.
-package discovery
+// Package peer provides the peer cache-server machinery.
+package peer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
-	"time"
 
 	"go.uber.org/zap"
 
 	cacheclient "github.com/gman0/kcp-cache-syncagent/internal/client"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/watch"
-	"k8s.io/client-go/dynamic"
+	kcpcorev1alpha1 "github.com/kcp-dev/sdk/apis/core/v1alpha1"
+	toolscache "k8s.io/client-go/tools/cache"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
+	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 )
 
-const (
-	// systemCacheServerShard is the virtual shard that holds the cache-server's
-	// own Cache object.
-	systemCacheServerShard = "system:cache:server"
-
-	// systemCacheCluster is the logical cluster that holds Cache objects.
-	systemCacheCluster = "system:cache"
-
-	// systemShardCluster is the logical cluster that holds Shard objects.
-	systemShardCluster = "system:shard"
-
-	// cacheAnnotationKey marks a Cache object with its owning cache-server name.
-	cacheAnnotationKey = "kcp.io/cache"
-
-	// clusterAnnotationKey holds the logical cluster of an object.
-	clusterAnnotationKey = "kcp.io/cluster"
-)
-
-var cacheGVR = schema.GroupVersionResource{
-	Group:    "core.kcp.io",
-	Version:  "v1alpha1",
-	Resource: "caches",
-}
+var _ multicluster.Provider = &Provider{}
+var _ multicluster.ProviderRunnable = &Provider{}
 
 // Provider implements multicluster.Provider and multicluster.ProviderRunnable.
 // It discovers peer cache-servers by watching Cache objects on the source.
@@ -72,12 +50,13 @@ type Provider struct {
 	certFile        string
 	keyFile         string
 	log             *zap.SugaredLogger
+	scheme          *runtime.Scheme
 
 	mu    sync.RWMutex
-	peers map[multicluster.ClusterName]*peer
+	peers map[multicluster.ClusterName]*peerEntry
 }
 
-type peer struct {
+type peerEntry struct {
 	cl     cluster.Cluster
 	cancel context.CancelFunc
 }
@@ -89,7 +68,12 @@ func New(
 	initialPeerURLs []string,
 	caFile, certFile, keyFile string,
 	log *zap.SugaredLogger,
-) *Provider {
+) (*Provider, error) {
+	scheme := runtime.NewScheme()
+	if err := kcpcorev1alpha1.AddToScheme(scheme); err != nil {
+		return nil, fmt.Errorf("registering kcp core scheme: %w", err)
+	}
+
 	return &Provider{
 		sourceConfig:    sourceConfig,
 		sourceURL:       sourceURL,
@@ -98,8 +82,9 @@ func New(
 		certFile:        certFile,
 		keyFile:         keyFile,
 		log:             log.Named("peer-discovery"),
-		peers:           make(map[multicluster.ClusterName]*peer),
-	}
+		scheme:          scheme,
+		peers:           make(map[multicluster.ClusterName]*peerEntry),
+	}, nil
 }
 
 // Start implements multicluster.ProviderRunnable.
@@ -111,39 +96,81 @@ func (p *Provider) Start(ctx context.Context, aware multicluster.Aware) error {
 		}
 	}
 
-	// Watch Cache objects on the source for ongoing peer discovery.
-	for {
-		if err := p.watchCacheObjects(ctx, aware); err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			p.log.Warnw("Cache watch loop failed, retrying", zap.Error(err))
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-time.After(5 * time.Second):
-			}
-		} else {
-			return nil
-		}
+	// Build a controller-runtime cache for watching Cache objects on the source.
+	sourceCache, err := ctrlcache.New(p.sourceConfig, ctrlcache.Options{
+		Scheme: p.scheme,
+	})
+	if err != nil {
+		return fmt.Errorf("creating source cache: %w", err)
 	}
+
+	informer, err := sourceCache.GetInformer(ctx, &kcpcorev1alpha1.Cache{}, ctrlcache.BlockUntilSynced(false))
+	if err != nil {
+		return fmt.Errorf("getting Cache informer: %w", err)
+	}
+
+	handler, err := informer.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
+			cacheObj, ok := obj.(*kcpcorev1alpha1.Cache)
+			if !ok {
+				return
+			}
+			if err := p.engageCacheObject(ctx, aware, cacheObj); err != nil {
+				p.log.Warnw("Failed to engage peer", zap.Error(err))
+			}
+		},
+		UpdateFunc: func(_, newObj any) {
+			cacheObj, ok := newObj.(*kcpcorev1alpha1.Cache)
+			if !ok {
+				return
+			}
+			if err := p.engageCacheObject(ctx, aware, cacheObj); err != nil {
+				p.log.Warnw("Failed to engage peer", zap.Error(err))
+			}
+		},
+		DeleteFunc: func(obj any) {
+			cacheObj, ok := obj.(*kcpcorev1alpha1.Cache)
+			if !ok {
+				tombstone, ok := obj.(toolscache.DeletedFinalStateUnknown)
+				if !ok {
+					p.log.Warnw("Couldn't get object from tombstone", "obj", obj)
+					return
+				}
+				cacheObj, ok = tombstone.Obj.(*kcpcorev1alpha1.Cache)
+				if !ok {
+					p.log.Warnw("Tombstone contained unexpected object type", "obj", tombstone.Obj)
+					return
+				}
+			}
+			p.disengageCacheObject(cacheObj)
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("adding event handler: %w", err)
+	}
+	defer func() {
+		if err := informer.RemoveEventHandler(handler); err != nil {
+			p.log.Warnw("Failed to remove event handler", zap.Error(err))
+		}
+	}()
+
+	return sourceCache.Start(ctx)
 }
 
-// seedFromPeer does an initial cross-shard LIST of Cache objects on peerURL to
-// discover peers that are already in the mesh.
+// seedFromPeer lists Cache objects on peerURL and engages each discovered peer.
 func (p *Provider) seedFromPeer(ctx context.Context, aware multicluster.Aware, peerURL string) error {
 	peerConfig, err := cacheclient.BuildConfig(peerURL, p.caFile, p.certFile, p.keyFile)
 	if err != nil {
 		return fmt.Errorf("building peer config for %s: %w", peerURL, err)
 	}
 
-	dynClient, err := dynamic.NewForConfig(peerConfig)
+	cl, err := client.New(peerConfig, client.Options{Scheme: p.scheme})
 	if err != nil {
-		return fmt.Errorf("creating dynamic client for %s: %w", peerURL, err)
+		return fmt.Errorf("creating client for %s: %w", peerURL, err)
 	}
 
-	list, err := dynClient.Resource(cacheGVR).List(ctx, metav1.ListOptions{})
-	if err != nil {
+	var list kcpcorev1alpha1.CacheList
+	if err := cl.List(ctx, &list); err != nil {
 		return fmt.Errorf("listing Cache objects on %s: %w", peerURL, err)
 	}
 
@@ -155,79 +182,23 @@ func (p *Provider) seedFromPeer(ctx context.Context, aware multicluster.Aware, p
 	return nil
 }
 
-// watchCacheObjects watches Cache objects on the source and calls Engage for
-// each new peer found.
-func (p *Provider) watchCacheObjects(ctx context.Context, aware multicluster.Aware) error {
-	dynClient, err := dynamic.NewForConfig(p.sourceConfig)
-	if err != nil {
-		return fmt.Errorf("creating dynamic client: %w", err)
-	}
-
-	list, err := dynClient.Resource(cacheGVR).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return fmt.Errorf("listing Cache objects: %w", err)
-	}
-
-	for i := range list.Items {
-		if err := p.engageCacheObject(ctx, aware, &list.Items[i]); err != nil {
-			p.log.Warnw("Failed to engage cache-server from list", zap.Error(err))
-		}
-	}
-
-	watcher, err := dynClient.Resource(cacheGVR).Watch(ctx, metav1.ListOptions{
-		ResourceVersion: list.GetResourceVersion(),
-	})
-	if err != nil {
-		return fmt.Errorf("watching Cache objects: %w", err)
-	}
-	defer watcher.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case event, ok := <-watcher.ResultChan():
-			if !ok {
-				return fmt.Errorf("watch channel closed")
-			}
-			obj, ok := event.Object.(*unstructured.Unstructured)
-			if !ok {
-				continue
-			}
-			switch event.Type {
-			case watch.Added, watch.Modified:
-				if err := p.engageCacheObject(ctx, aware, obj); err != nil {
-					p.log.Warnw("Failed to engage cache-server", zap.Error(err))
-				}
-			case watch.Deleted:
-				p.disengageCacheObject(obj)
-			}
-		}
-	}
-}
-
-// engageCacheObject processes a Cache object: if it represents a peer
-// cache-server (not our own source), creates a cluster for it and calls Engage.
-func (p *Provider) engageCacheObject(ctx context.Context, aware multicluster.Aware, obj *unstructured.Unstructured) error {
-	baseURL, found, err := unstructured.NestedString(obj.Object, "spec", "baseURL")
-	if err != nil || !found || baseURL == "" {
+// engageCacheObject processes a Cache object: if it's a new peer (not our own
+// source), creates a cluster for it and calls Engage.
+func (p *Provider) engageCacheObject(ctx context.Context, aware multicluster.Aware, obj *kcpcorev1alpha1.Cache) error {
+	baseURL := obj.Spec.BaseURL
+	if baseURL == "" || baseURL == p.sourceURL {
 		return nil
 	}
 
-	// Skip the source's own Cache object.
-	if baseURL == p.sourceURL {
-		return nil
-	}
-
-	// Cache object name is the cache-server's name.
 	peerName := multicluster.ClusterName(obj.GetName())
 	if peerName == "" {
 		return nil
 	}
 
-	p.mu.Lock()
+	// Fast path: already engaged.
+	p.mu.RLock()
 	_, already := p.peers[peerName]
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	if already {
 		return nil
 	}
@@ -245,14 +216,22 @@ func (p *Provider) engageCacheObject(ctx context.Context, aware multicluster.Awa
 	peerCtx, cancel := context.WithCancel(ctx)
 
 	p.mu.Lock()
-	// Double-check under lock.
+	// Double-check under write lock.
 	if _, already := p.peers[peerName]; already {
 		p.mu.Unlock()
 		cancel()
 		return nil
 	}
-	p.peers[peerName] = &peer{cl: peerCluster, cancel: cancel}
+	p.peers[peerName] = &peerEntry{cl: peerCluster, cancel: cancel}
 	p.mu.Unlock()
+
+	// Start the peer cluster's cache in the background so that MultiClusterWatch
+	// sources can call GetInformer and WaitForCacheSync when Engage is called.
+	go func() {
+		if err := peerCluster.Start(peerCtx); err != nil && !errors.Is(err, context.Canceled) {
+			p.log.Warnw("Peer cluster exited unexpectedly", "peer", peerName, zap.Error(err))
+		}
+	}()
 
 	p.log.Infow("Engaging peer cache-server", "peer", peerName, "url", baseURL)
 
@@ -268,7 +247,7 @@ func (p *Provider) engageCacheObject(ctx context.Context, aware multicluster.Awa
 }
 
 // disengageCacheObject cancels the context for a peer whose Cache object was deleted.
-func (p *Provider) disengageCacheObject(obj *unstructured.Unstructured) {
+func (p *Provider) disengageCacheObject(obj *kcpcorev1alpha1.Cache) {
 	peerName := multicluster.ClusterName(obj.GetName())
 	if peerName == "" {
 		return

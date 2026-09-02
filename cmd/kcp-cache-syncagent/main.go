@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	golog "log"
 	"time"
@@ -29,12 +30,13 @@ import (
 	cacheclient "github.com/gman0/kcp-cache-syncagent/internal/client"
 	kshard "github.com/gman0/kcp-cache-syncagent/internal/client/shard"
 	"github.com/gman0/kcp-cache-syncagent/internal/controller/crdmanager"
-	"github.com/gman0/kcp-cache-syncagent/internal/discovery"
+	shardtracker "github.com/gman0/kcp-cache-syncagent/internal/controller/shard"
 	syncagentlog "github.com/gman0/kcp-cache-syncagent/internal/log"
 	dynmanager "github.com/gman0/kcp-cache-syncagent/internal/manager"
-	shardtracker "github.com/gman0/kcp-cache-syncagent/internal/shard"
+	"github.com/gman0/kcp-cache-syncagent/internal/peer"
 	"github.com/gman0/kcp-cache-syncagent/internal/version"
 
+	kcpcrypto "github.com/kcp-dev/apimachinery/v2/pkg/util/crypto"
 	"github.com/kcp-dev/logicalcluster/v3"
 	kcpcorev1alpha1 "github.com/kcp-dev/sdk/apis/core/v1alpha1"
 	kcpclientset "github.com/kcp-dev/sdk/client/clientset/versioned/cluster"
@@ -43,12 +45,12 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	// "k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlruntimelog "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 )
 
 const resyncPeriod = 10 * time.Hour
@@ -81,20 +83,97 @@ func run(ctx context.Context, log *zap.SugaredLogger, opts *Options) error {
 	v := version.NewAppVersion()
 	log.Infow("Starting kcp cache-syncagent", "version", v.GitVersion, "source", opts.SourceURL)
 
-	// Build the TLS-authenticated rest.Config for the source cache-server.
-	sourceConfig, err := cacheclient.BuildConfig(
-		opts.SourceURL,
+	scheme := runtime.NewScheme()
+	if err := apiextensionsv1.AddToScheme(scheme); err != nil {
+		return fmt.Errorf("registering apiextensions scheme: %w", err)
+	}
+	if err := kcpcorev1alpha1.AddToScheme(scheme); err != nil {
+		return fmt.Errorf("registering kcp core scheme: %w", err)
+	}
+
+	// Setup client configs.
+
+	localRestConfig := ctrl.GetConfigOrDie()
+	if opts.KubeconfigHostOverride != "" {
+		localRestConfig.Host = opts.KubeconfigHostOverride
+	}
+	if opts.KubeconfigCAFileOverride != "" {
+		if len(localRestConfig.TLSClientConfig.CAData) > 0 {
+			localRestConfig.TLSClientConfig.CAData = nil
+		}
+		localRestConfig.TLSClientConfig.CAFile = opts.KubeconfigCAFileOverride
+	}
+
+	sourceRestConfig, err := cacheclient.BuildConfig(opts.SourceURL,
 		opts.CacheClientCAFile,
 		opts.CacheClientCertFile,
 		opts.CacheClientKeyFile,
 	)
 	if err != nil {
-		return fmt.Errorf("building source config: %w", err)
+		return fmt.Errorf("building source cache server REST config: %w", err)
 	}
 
-	// Build a shared informer against the source cache.
+	// Peer discovery provider: watches Cache objects on the source for peers.
+	peerDiscoveryProvider, err := peer.New(
+		sourceRestConfig,
+		opts.SourceURL,
+		opts.InitialPeerURLs,
+		opts.CacheClientCAFile,
+		opts.CacheClientCertFile,
+		opts.CacheClientKeyFile,
+		log,
+	)
+	if err != nil {
+		return fmt.Errorf("creating peer discovery provider: %w", err)
+	}
 
-	sourceClient, err := kcpclientset.NewForConfig(sourceConfig)
+	// Main multicluster manager: runs on local cluster for leader election,
+	// uses the peer discovery provider for peer coordination.
+	leaderElectionIDSuffixHash := sha256.Sum224([]byte(opts.SourceURL))
+	leaderElectionIDSuffix := kcpcrypto.Base36.BytesPad(leaderElectionIDSuffixHash[:])[8:]
+	mgr, err := mcmanager.New(localRestConfig, peerDiscoveryProvider, ctrl.Options{
+		Scheme: scheme,
+		Metrics: metricsserver.Options{
+			BindAddress: opts.MetricsAddr,
+		},
+		BaseContext:                   func() context.Context { return ctx },
+		HealthProbeBindAddress:        opts.HealthAddr,
+		LeaderElection:                opts.EnableLeaderElection,
+		LeaderElectionID:              "kcp-cache-syncagent-" + leaderElectionIDSuffix,
+		LeaderElectionNamespace:       opts.Namespace,
+		LeaderElectionReleaseOnCancel: true,
+	})
+	if err != nil {
+		return fmt.Errorf("creating multicluster manager: %w", err)
+	}
+
+	// DynamicMultiClusterManager wraps the mc manager to allow controllers to
+	// be started dynamically (one per CRD) and pre-seeded with known peers.
+	dmcm, err := dynmanager.New(mgr)
+	if err != nil {
+		return fmt.Errorf("creating dynamic multicluster manager: %w", err)
+	}
+
+	// Source manager: controller-runtime manager pointed at the source
+	// cache-server. CRD and Shard controllers register here.
+	sourceMgr, err := ctrl.NewManager(sourceRestConfig, ctrl.Options{
+		Scheme: scheme,
+		Metrics: metricsserver.Options{
+			BindAddress: "0", // metrics are served by the main manager
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("creating source manager: %w", err)
+	}
+
+	// Add the source manager as a runnable so it starts with the main manager.
+	if err := mgr.GetLocalManager().Add(sourceMgr); err != nil {
+		return fmt.Errorf("adding source manager: %w", err)
+	}
+
+	// Build a kcpclientset against the source for peer discovery informers and
+	// own-name resolution (requires cross-shard access via the kcp client).
+	sourceClient, err := kcpclientset.NewForConfig(sourceRestConfig)
 	if err != nil {
 		return fmt.Errorf("creating source client: %w", err)
 	}
@@ -115,70 +194,14 @@ func run(ctx context.Context, log *zap.SugaredLogger, opts *Options) error {
 	}
 	log.Infow("Resolved own cache-server name", "name", ownName)
 
-	// Build the source manager's scheme.
-	scheme := runtime.NewScheme()
-	if err := apiextensionsv1.AddToScheme(scheme); err != nil {
-		return fmt.Errorf("registering apiextensions scheme: %w", err)
-	}
-	if err := kcpcorev1alpha1.AddToScheme(scheme); err != nil {
-		return fmt.Errorf("registering kcp core scheme: %w", err)
-	}
-
-	// Optional leader election via a separate Kubernetes cluster.
-	leaderElectionEnabled := opts.LeaderElectionKubeconfig != ""
-	var leaderElectionConfig *rest.Config
-	if leaderElectionEnabled {
-		leaderElectionConfig, err = loadKubeconfig(opts.LeaderElectionKubeconfig)
-		if err != nil {
-			return fmt.Errorf("loading leader-election kubeconfig: %w", err)
-		}
-	}
-
-	// Create the source manager (connects to the source cache-server).
-	sourceMgr, err := manager.New(sourceConfig, manager.Options{
-		Scheme: scheme,
-		BaseContext: func() context.Context {
-			return ctx
-		},
-		Metrics:                       metricsserver.Options{BindAddress: opts.MetricsAddr},
-		HealthProbeBindAddress:        opts.HealthAddr,
-		LeaderElection:                leaderElectionEnabled,
-		LeaderElectionID:              "kcp-cache-syncagent",
-		LeaderElectionNamespace:       opts.Namespace,
-		LeaderElectionConfig:          leaderElectionConfig,
-		LeaderElectionReleaseOnCancel: true,
-	})
-	if err != nil {
-		return fmt.Errorf("creating source manager: %w", err)
-	}
-
 	// Authoritative shard tracker: watches Shard objects on the source.
-	tracker := shardtracker.New(sourceConfig, ownName, log)
-	if err := sourceMgr.Add(tracker); err != nil {
-		return fmt.Errorf("adding shard tracker: %w", err)
-	}
-
-	// Peer discovery peerDiscoveryProvider: watches Cache objects on the source for peers.
-	peerDiscoveryProvider := discovery.New(
-		sourceConfig,
-		opts.SourceURL,
-		opts.InitialPeerURLs,
-		opts.CacheClientCAFile,
-		opts.CacheClientCertFile,
-		opts.CacheClientKeyFile,
-		log,
-	)
-
-	// DynamicMultiClusterManager wraps the source manager with multicluster
-	// coordination; the provider is started automatically by mcManager.Start.
-	dmcm, err := dynmanager.New(sourceMgr, peerDiscoveryProvider)
+	tracker, err := shardtracker.Add(sourceMgr, ownName, log)
 	if err != nil {
-		return fmt.Errorf("creating dynamic multicluster manager: %w", err)
+		return fmt.Errorf("setting up shard tracker: %w", err)
 	}
 
 	// CRD manager: watches CRDs and starts/stops replication controllers.
-	crdMgr := crdmanager.New(sourceConfig, dmcm, tracker, log)
-	if err := sourceMgr.Add(crdMgr); err != nil {
+	if err := crdmanager.Add(ctx, sourceMgr, dmcm, tracker, log); err != nil {
 		return fmt.Errorf("adding CRD manager: %w", err)
 	}
 

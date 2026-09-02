@@ -46,7 +46,7 @@ two dynamic dimensions:
 
 ## What is new / does not exist in api-syncagent
 
-### 1. Peer discovery (`internal/discovery`)
+### 1. Peer discovery (`internal/peer`)
 
 api-syncagent uses `multicluster-provider/apiexport.New()` which watches APIExportEndpointSlice.
 We need a new `multicluster.Provider` implementation that:
@@ -130,17 +130,13 @@ tool) and Option 2 (autonomous GC on cache-servers) as candidate approaches.
 internal/
 ├── client/
 │   └── builder.go          Build rest.Config from URL+TLS; shard-in-URL round-tripper
-├── discovery/
-│   └── peer.go             Peer discovery: multicluster.Provider driven by Cache objects
+├── peer/
+│   └── discovery.go        Peer discovery: multicluster.Provider driven by Cache objects
 ├── shard/
 │   └── tracker.go          Authoritative shard set (cross-shard Shard object watch)
 ├── controller/
-│   ├── cache/              (existing skeleton) remove — peer discovery moves into discovery/
 │   ├── crdmanager/         CRD-driven lifecycle: starts/stops a Replication controller per type
 │   └── replication/        Replication controller: source + peer informers, reconcile logic
 └── ...existing (log, metrics, version, kubeconfig, options)...
 ```
-
-The existing `internal/controller/cache` skeleton becomes redundant once the peer discovery
-component (`internal/discovery/`) handles peer discovery. Remove it.
 

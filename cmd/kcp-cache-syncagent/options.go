@@ -48,15 +48,16 @@ type Options struct {
 	// the source.
 	InitialPeerURLs []string
 
-	// LeaderElectionKubeconfig is a kubeconfig for a separate Kubernetes cluster
-	// used to store leader-election leases. The cache-server is apiextensions-only
-	// and cannot serve coordination.k8s.io/v1 leases itself.
-	// If empty, leader election is disabled.
-	LeaderElectionKubeconfig string
+	// Whether or not to perform leader election (requires permissions to
+	// manage coordination/v1 leases)
+	EnableLeaderElection bool
 
 	// Namespace is the Kubernetes namespace used for leader-election lease
 	// objects (only meaningful when LeaderElectionKubeconfig is set).
 	Namespace string
+
+	KubeconfigHostOverride   string
+	KubeconfigCAFileOverride string
 
 	LogOptions log.Options
 
