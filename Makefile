@@ -30,7 +30,7 @@ LDFLAGS_EXTRA =
 GOTOOLFLAGS_EXTRA = -gcflags=all="-N -l"
 endif
 
-BUILD_DEST ?= _build
+BUILD_DEST ?= bin
 GOTOOLFLAGS ?= $(GOBUILDFLAGS) -ldflags '$(LDFLAGS) $(LDFLAGS_EXTRA)' $(GOTOOLFLAGS_EXTRA)
 GOARCH ?= $(shell go env GOARCH)
 GOOS ?= $(shell go env GOOS)

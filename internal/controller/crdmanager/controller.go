@@ -52,11 +52,11 @@ type Controller struct {
 	tracker      *shard.Tracker
 	log          *zap.SugaredLogger
 
-	mu          sync.Mutex
+	mu sync.Mutex
 	// crdCount tracks how many shards report each CRD (by group/resource).
-	crdCount    map[string]int
+	crdCount map[string]int
 	// crdCancels holds the cancel func for each active replication controller.
-	crdCancels  map[string]context.CancelFunc
+	crdCancels map[string]context.CancelFunc
 }
 
 // New creates a CRDManager.
@@ -111,7 +111,7 @@ func (c *Controller) run(ctx context.Context, dynClient dynamic.Interface) error
 	}
 
 	watcher, err := dynClient.Resource(crdGVR).Watch(ctx, metav1.ListOptions{
-		ResourceVersion: list.ResourceVersion,
+		ResourceVersion: list.GetResourceVersion(),
 	})
 	if err != nil {
 		return fmt.Errorf("watching CRDs: %w", err)

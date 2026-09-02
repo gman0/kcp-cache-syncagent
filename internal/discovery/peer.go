@@ -49,10 +49,6 @@ const (
 	// systemShardCluster is the logical cluster that holds Shard objects.
 	systemShardCluster = "system:shard"
 
-	// cacheSelfAnnotation is the annotation value on the source's own Cache
-	// object.
-	cacheSelfAnnotation = ".self"
-
 	// cacheAnnotationKey marks a Cache object with its owning cache-server name.
 	cacheAnnotationKey = "kcp.io/cache"
 
@@ -78,10 +74,10 @@ type Provider struct {
 	log             *zap.SugaredLogger
 
 	mu    sync.RWMutex
-	peers map[multicluster.ClusterName]*peerEntry
+	peers map[multicluster.ClusterName]*peer
 }
 
-type peerEntry struct {
+type peer struct {
 	cl     cluster.Cluster
 	cancel context.CancelFunc
 }
@@ -102,7 +98,7 @@ func New(
 		certFile:        certFile,
 		keyFile:         keyFile,
 		log:             log.Named("peer-discovery"),
-		peers:           make(map[multicluster.ClusterName]*peerEntry),
+		peers:           make(map[multicluster.ClusterName]*peer),
 	}
 }
 
@@ -179,7 +175,7 @@ func (p *Provider) watchCacheObjects(ctx context.Context, aware multicluster.Awa
 	}
 
 	watcher, err := dynClient.Resource(cacheGVR).Watch(ctx, metav1.ListOptions{
-		ResourceVersion: list.ResourceVersion,
+		ResourceVersion: list.GetResourceVersion(),
 	})
 	if err != nil {
 		return fmt.Errorf("watching Cache objects: %w", err)
@@ -255,7 +251,7 @@ func (p *Provider) engageCacheObject(ctx context.Context, aware multicluster.Awa
 		cancel()
 		return nil
 	}
-	p.peers[peerName] = &peerEntry{cl: peerCluster, cancel: cancel}
+	p.peers[peerName] = &peer{cl: peerCluster, cancel: cancel}
 	p.mu.Unlock()
 
 	p.log.Infow("Engaging peer cache-server", "peer", peerName, "url", baseURL)

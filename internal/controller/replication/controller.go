@@ -135,7 +135,7 @@ func (c *Controller) runSource(ctx context.Context, dynClient dynamic.Interface)
 	}
 
 	watcher, err := dynClient.Resource(c.gvr).Watch(ctx, metav1.ListOptions{
-		ResourceVersion: list.ResourceVersion,
+		ResourceVersion: list.GetResourceVersion(),
 	})
 	if err != nil {
 		return fmt.Errorf("watching source objects: %w", err)
@@ -236,7 +236,7 @@ func (c *Controller) runPeerLoop(ctx context.Context, name multicluster.ClusterN
 	}
 
 	watcher, err := pc.dyn.Resource(c.gvr).Watch(ctx, metav1.ListOptions{
-		ResourceVersion: list.ResourceVersion,
+		ResourceVersion: list.GetResourceVersion(),
 	})
 	if err != nil {
 		return fmt.Errorf("watching peer objects: %w", err)

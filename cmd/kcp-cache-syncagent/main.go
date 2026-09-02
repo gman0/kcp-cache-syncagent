@@ -20,7 +20,7 @@ import (
 	"context"
 	"fmt"
 	golog "log"
-	"strings"
+	"time"
 
 	"github.com/go-logr/zapr"
 	"github.com/spf13/pflag"
@@ -35,19 +35,23 @@ import (
 	shardtracker "github.com/gman0/kcp-cache-syncagent/internal/shard"
 	"github.com/gman0/kcp-cache-syncagent/internal/version"
 
+	"github.com/kcp-dev/logicalcluster/v3"
 	kcpcorev1alpha1 "github.com/kcp-dev/sdk/apis/core/v1alpha1"
+	kcpclientset "github.com/kcp-dev/sdk/client/clientset/versioned/cluster"
+	kcpinformers "github.com/kcp-dev/sdk/client/informers/externalversions"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/dynamic"
+	// "k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrlruntimelog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
+
+const resyncPeriod = 10 * time.Hour
 
 func main() {
 	ctx := context.Background()
@@ -88,8 +92,24 @@ func run(ctx context.Context, log *zap.SugaredLogger, opts *Options) error {
 		return fmt.Errorf("building source config: %w", err)
 	}
 
+	// Build a shared informer against the source cache.
+
+	sourceClient, err := kcpclientset.NewForConfig(sourceConfig)
+	if err != nil {
+		return fmt.Errorf("creating source client: %w", err)
+	}
+	sourceKcpSharedInformerFactory := kcpinformers.NewSharedInformerFactoryWithOptions(
+		sourceClient,
+		resyncPeriod,
+	)
+
+	log.Info("Starting source informers")
+	go sourceKcpSharedInformerFactory.Core().V1alpha1().Caches().Informer().RunWithContext(ctx)
+	go sourceKcpSharedInformerFactory.Core().V1alpha1().Shards().Informer().RunWithContext(ctx)
+	sourceKcpSharedInformerFactory.Start(ctx.Done())
+
 	// Resolve own cache-server name from the source before the manager starts.
-	ownName, err := resolveOwnName(ctx, sourceConfig)
+	ownName, err := resolveOwnName(ctx, sourceClient)
 	if err != nil {
 		return fmt.Errorf("resolving own cache-server name: %w", err)
 	}
@@ -120,7 +140,7 @@ func run(ctx context.Context, log *zap.SugaredLogger, opts *Options) error {
 		BaseContext: func() context.Context {
 			return ctx
 		},
-		Metrics:                      metricsserver.Options{BindAddress: opts.MetricsAddr},
+		Metrics:                       metricsserver.Options{BindAddress: opts.MetricsAddr},
 		HealthProbeBindAddress:        opts.HealthAddr,
 		LeaderElection:                leaderElectionEnabled,
 		LeaderElectionID:              "kcp-cache-syncagent",
@@ -138,8 +158,8 @@ func run(ctx context.Context, log *zap.SugaredLogger, opts *Options) error {
 		return fmt.Errorf("adding shard tracker: %w", err)
 	}
 
-	// Peer discovery provider: watches Cache objects on the source for peers.
-	provider := discovery.New(
+	// Peer discovery peerDiscoveryProvider: watches Cache objects on the source for peers.
+	peerDiscoveryProvider := discovery.New(
 		sourceConfig,
 		opts.SourceURL,
 		opts.InitialPeerURLs,
@@ -151,7 +171,7 @@ func run(ctx context.Context, log *zap.SugaredLogger, opts *Options) error {
 
 	// DynamicMultiClusterManager wraps the source manager with multicluster
 	// coordination; the provider is started automatically by mcManager.Start.
-	dmcm, err := dynmanager.New(sourceMgr, provider)
+	dmcm, err := dynmanager.New(sourceMgr, peerDiscoveryProvider)
 	if err != nil {
 		return fmt.Errorf("creating dynamic multicluster manager: %w", err)
 	}
@@ -169,37 +189,15 @@ func run(ctx context.Context, log *zap.SugaredLogger, opts *Options) error {
 // resolveOwnName reads the self-identifying Cache object from
 // system:cache:server shard / system:cache cluster on the source to determine
 // this syncagent's cache-server name.
-func resolveOwnName(ctx context.Context, sourceConfig *rest.Config) (string, error) {
-	dynClient, err := dynamic.NewForConfig(sourceConfig)
-	if err != nil {
-		return "", fmt.Errorf("creating dynamic client: %w", err)
-	}
-
-	cacheGVR := schema.GroupVersionResource{
-		Group:    "core.kcp.io",
-		Version:  "v1alpha1",
-		Resource: "caches",
-	}
-
-	// Override wildcard defaults for this targeted GET.
+func resolveOwnName(ctx context.Context, sourceClient kcpclientset.ClusterInterface) (string, error) {
 	reqCtx := cacheclient.WithShardInContext(ctx, kshard.New("system:cache:server"))
-	reqCtx = cacheclient.WithClusterInContext(reqCtx, "system:cache")
-
-	list, err := dynClient.Resource(cacheGVR).List(reqCtx, metav1.ListOptions{})
+	list, err := sourceClient.Cluster(logicalcluster.NewPath("system:cache")).CoreV1alpha1().Caches().List(reqCtx, metav1.ListOptions{})
 	if err != nil {
 		return "", fmt.Errorf("listing Cache objects in system:cache:server/system:cache: %w", err)
 	}
 
-	for _, item := range list.Items {
-		// The self-identifying Cache object carries kcp.io/cache: .self
-		if ann := item.GetAnnotations(); strings.EqualFold(ann["kcp.io/cache"], ".self") {
-			return item.GetName(), nil
-		}
-	}
-
-	// Fallback: if only one object exists in that location, use it.
 	if len(list.Items) == 1 {
-		return list.Items[0].GetName(), nil
+		return list.Items[0].Name, nil
 	}
 
 	return "", fmt.Errorf("could not identify own Cache object in system:cache:server/system:cache (found %d objects)", len(list.Items))

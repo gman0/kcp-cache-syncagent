@@ -48,8 +48,8 @@ const (
 )
 
 var shardGVR = schema.GroupVersionResource{
-	Group:   "core.kcp.io",
-	Version: "v1alpha1",
+	Group:    "core.kcp.io",
+	Version:  "v1alpha1",
 	Resource: "shards",
 }
 
@@ -113,7 +113,7 @@ func (t *Tracker) run(ctx context.Context, dynClient dynamic.Interface) error {
 	t.log.Infow("Initial shard sync complete", "authoritative", t.count())
 
 	watcher, err := dynClient.Resource(shardGVR).Watch(ctx, metav1.ListOptions{
-		ResourceVersion: list.ResourceVersion,
+		ResourceVersion: list.GetResourceVersion(),
 	})
 	if err != nil {
 		return fmt.Errorf("watching shards: %w", err)
