@@ -6,7 +6,7 @@
 * There MAY BE many shards in the kcp installation.
 * There MAY BE many cache-servers in the kcp installation.
 * Each shard gets a kubeconfig for one cache-server (it starts with `kcp start ... --cache-kubeconfig=<kubeconfig file>`).
-* Each cache-server creates a special, self-identifying Cache object (see @kcp/staging/src/github.com/kcp-dev/sdk/apis/core/v1alpha1/cache_types.go) in its `system:cache:server` shard & `system:cache` cluster, with special `kcp.io/cache: .self` annotation. Note: `system:cache:server` is a virtual shard — a cache-local etcd prefix convention with no corresponding Shard object. It exists purely to give system-level cache resources a distinct, unambiguous prefix in etcd.
+* Each cache-server creates a special, self-identifying Cache object (see @kcp/staging/src/github.com/kcp-dev/sdk/apis/core/v1alpha1/cache_types.go) in its `system:cache:server` shard & `system:cache` cluster. Note: `system:cache:server` is a virtual shard — a cache-local etcd prefix convention with no corresponding Shard object. It exists purely to give system-level cache resources a distinct, unambiguous prefix in etcd.
 * Each shard pulls Cache object(s) from its associated cache-server into its `system:shard` cluster (see the reconciler in @kcp/pkg/reconciler/core/cache). This makes Cache objects part of real shard data, stored under the shard's own etcd prefix.
 * Each shard pushes a set of resources into its cache-server, into `<Storage prefix> / <Group> / <Resource> / [ <If CR-based, then this segment contains Identity (if APIBinding) or "customresources" (if local CRD)> / ] <Shard> / <Cluster> / [ <Namespace> / ] <Name>`
   * Observe the `<Shard>` segment. This is resolved from:

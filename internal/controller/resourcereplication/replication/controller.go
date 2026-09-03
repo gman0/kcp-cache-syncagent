@@ -26,7 +26,6 @@ import (
 
 	cacheclient "github.com/gman0/kcp-cache-syncagent/internal/client"
 	kshard "github.com/gman0/kcp-cache-syncagent/internal/client/shard"
-	"github.com/gman0/kcp-cache-syncagent/internal/clusters"
 	"github.com/gman0/kcp-cache-syncagent/internal/controller/authoritativeshardregistry"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -34,8 +33,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -65,7 +64,8 @@ type Reconciler struct {
 // inside the source-watch event mapper to fan out one reconcile request per peer.
 func Create(
 	ctx context.Context,
-	sourceCl cluster.Cluster,
+	sourceClient ctrlclient.Client,
+	sourceCache ctrlcache.Cache,
 	mcMgr mcmanager.Manager,
 	gvr schema.GroupVersionResource,
 	gvk schema.GroupVersionKind,
@@ -76,7 +76,7 @@ func Create(
 	log = log.Named("replication").With("gvr", gvr)
 
 	r := &Reconciler{
-		sourceClient:  sourceCl.GetClient(),
+		sourceClient:  sourceClient,
 		mcMgr:         mcMgr,
 		shardRegistry: shardRegistry,
 		gvk:           gvk,
@@ -105,7 +105,7 @@ func Create(
 	// Watch each peer cluster to detect and correct drift.
 	if err := c.MultiClusterWatch(mcsource.TypedKind(peerDummy,
 		mchandler.TypedEnqueueRequestForObject[*unstructured.Unstructured](),
-	).WithClusterFilter(clusters.IsPeer)); err != nil {
+	)); err != nil {
 		return nil, fmt.Errorf("setting up peer watch: %w", err)
 	}
 
@@ -124,7 +124,7 @@ func Create(
 		}
 		return reqs
 	})
-	if err := c.Watch(source.TypedKind(sourceCl.GetCache(), sourceDummy, enqueueAllPeers, authoritativeShard)); err != nil {
+	if err := c.Watch(source.TypedKind(sourceCache, sourceDummy, enqueueAllPeers, authoritativeShard)); err != nil {
 		return nil, fmt.Errorf("setting up source watch: %w", err)
 	}
 
@@ -152,12 +152,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (re
 		return reconcile.Result{}, nil
 	}
 
-	// Inject shard+cluster into context for correct URL routing on the peer.
+	// Inject the shard into context for correct URL routing on the peer.
+	// Cluster routing is not needed: the cache-server derives the cluster from
+	// the object's annotations server-side, not from the URL.
 	peerCtx := ctx
 	if !sourceNotFound {
 		ann := sourceObj.GetAnnotations()
 		peerCtx = cacheclient.WithShardInContext(ctx, kshard.New(ann[kshard.AnnotationKey]))
-		peerCtx = cacheclient.WithClusterInContext(peerCtx, ann["kcp.io/cluster"])
 	}
 
 	// Fetch peer state.
@@ -174,7 +175,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (re
 			// Derive shard routing from the peer object's own annotations.
 			ann := peerObj.GetAnnotations()
 			deleteCtx := cacheclient.WithShardInContext(ctx, kshard.New(ann[kshard.AnnotationKey]))
-			deleteCtx = cacheclient.WithClusterInContext(deleteCtx, ann["kcp.io/cluster"])
 			return reconcile.Result{}, ctrlclient.IgnoreNotFound(peerClient.Delete(deleteCtx, peerObj))
 		}
 		return reconcile.Result{}, nil

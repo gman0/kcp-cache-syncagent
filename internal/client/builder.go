@@ -25,22 +25,11 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-// BuildConfig creates a *rest.Config for direct mTLS access to a cache-server.
-// The config is pre-wrapped with the four-layer round-tripper chain so that
-// bare clients perform wildcard shard+cluster requests by default.
-// Callers override the defaults by setting shard/cluster in the request context
-// via WithShardInContext / WithClusterInContext.
-//
-// Round-tripper execution order at runtime:
-//
-//	DefaultCluster → DefaultShard → ClusterRT → ShardRT → transport
-//
-// Wildcard reads: no context override → defaults propagate → URL becomes
-//
-//	/shards/*/clusters/*/...
-//
-// Targeted writes: caller sets shard+cluster in context → overrides defaults.
-func BuildConfig(serverURL, caFile, certFile, keyFile string) (*rest.Config, error) {
+// BuildKcpConfig creates a *rest.Config for direct mTLS access to a cache-server.
+// The config is pre-wrapped with shard round-trippers that default to the wildcard
+// shard; callers can override per-request via WithShardInContext.
+// Intended for use with kcp-aware clients.
+func BuildKcpConfig(serverURL, caFile, certFile, keyFile string) (*rest.Config, error) {
 	caData, err := os.ReadFile(caFile)
 	if err != nil {
 		return nil, fmt.Errorf("reading CA file: %w", err)
@@ -66,9 +55,7 @@ func BuildConfig(serverURL, caFile, certFile, keyFile string) (*rest.Config, err
 	// Apply round-tripper chain innermost first (each cfg.Wrap call adds an
 	// outer layer over the previous chain).
 	WithShardNameFromContextRoundTripper(cfg)
-	WithClusterNameFromContextRoundTripper(cfg)
 	WithDefaultShardRoundTripper(cfg, kshard.Wildcard)
-	WithDefaultClusterRoundTripper(cfg, "*")
 
 	return cfg, nil
 }

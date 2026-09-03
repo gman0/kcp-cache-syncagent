@@ -23,12 +23,8 @@ import (
 )
 
 type shardContextKey int
-type clusterContextKey int
 
-const (
-	shardKey   shardContextKey   = iota
-	clusterKey clusterContextKey = iota
-)
+const shardKey shardContextKey = iota
 
 // WithShardInContext returns a context with the given shard name set.
 func WithShardInContext(parent context.Context, s kshard.Name) context.Context {
@@ -42,18 +38,4 @@ func ShardFromContext(ctx context.Context) kshard.Name {
 		return ""
 	}
 	return s
-}
-
-// WithClusterInContext returns a context with the given cluster name set.
-func WithClusterInContext(parent context.Context, cluster string) context.Context {
-	return context.WithValue(parent, clusterKey, cluster)
-}
-
-// ClusterFromContext returns the cluster name stored in ctx, or empty if not set.
-func ClusterFromContext(ctx context.Context) string {
-	c, ok := ctx.Value(clusterKey).(string)
-	if !ok {
-		return ""
-	}
-	return c
 }

@@ -56,9 +56,6 @@ type Options struct {
 	// objects (only meaningful when LeaderElectionKubeconfig is set).
 	Namespace string
 
-	KubeconfigHostOverride   string
-	KubeconfigCAFileOverride string
-
 	LogOptions log.Options
 
 	MetricsAddr string

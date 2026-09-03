@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package client contains round-trippers for shard-and-cluster-aware cache-server access.
+// Package client contains round-trippers for shard-aware cache-server access.
 // Adapted from github.com/kcp-dev/kcp/pkg/cache/client.
 package client
 
 import (
+	"fmt"
 	"net/http"
 	"regexp"
 	"strings"
@@ -28,10 +29,7 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-var (
-	shardSegmentRegex   = regexp.MustCompile(`shards/([^/]+)/.+`)
-	clusterSegmentRegex = regexp.MustCompile(`clusters/([^/]+)/.+`)
-)
+var shardSegmentRegex = regexp.MustCompile(`shards/([^/]+)/.+`)
 
 // WithShardNameFromContextRoundTripper wraps cfg so that every request reads
 // the shard name from its context and injects it into the URL path.
@@ -44,10 +42,13 @@ func WithShardNameFromContextRoundTripper(cfg *rest.Config) {
 type shardRoundTripper struct{ delegate http.RoundTripper }
 
 func (r *shardRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if s := ShardFromContext(req.Context()); !s.Empty() {
+	s := ShardFromContext(req.Context())
+	fmt.Printf("### kcp-cache-syncagent/internal/client/round_tripper.go shardRoundTripper shard=%q path-before=%q\n", s, req.URL.String())
+	if !s.Empty() {
 		req = req.Clone(req.Context())
 		req.URL.Path = shardInPath(req.URL.Path, s)
 		req.URL.RawPath = shardInPath(req.URL.RawPath, s)
+		fmt.Printf("### kcp-cache-syncagent/internal/client/round_tripper.go shardRoundTripper path-after=%q\n", req.URL.String())
 	}
 	return r.delegate.RoundTrip(req)
 }
@@ -90,69 +91,6 @@ type defaultShardRoundTripper struct {
 func (r *defaultShardRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if ShardFromContext(req.Context()).Empty() {
 		req = req.WithContext(WithShardInContext(req.Context(), r.shard))
-	}
-	return r.delegate.RoundTrip(req)
-}
-
-// WithClusterNameFromContextRoundTripper wraps cfg so that every request reads
-// the cluster name from its context and injects it into the URL path.
-func WithClusterNameFromContextRoundTripper(cfg *rest.Config) {
-	cfg.Wrap(func(rt http.RoundTripper) http.RoundTripper {
-		return &clusterRoundTripper{delegate: rt}
-	})
-}
-
-type clusterRoundTripper struct{ delegate http.RoundTripper }
-
-func (r *clusterRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if c := ClusterFromContext(req.Context()); c != "" {
-		req = req.Clone(req.Context())
-		req.URL.Path = clusterInPath(req.URL.Path, c)
-		req.URL.RawPath = clusterInPath(req.URL.RawPath, c)
-	}
-	return r.delegate.RoundTrip(req)
-}
-
-// clusterInPath rewrites orig so that /clusters/<cluster>/ appears before the
-// API path segment (after any existing /shards/<shard>/ prefix, which is
-// injected by the inner ShardRoundTripper that runs after us in the chain).
-func clusterInPath(orig, cluster string) string {
-	prefix := "/clusters/" + cluster
-	if strings.HasPrefix(orig, prefix+"/") || orig == prefix {
-		return orig
-	}
-	if strings.HasPrefix(orig, "/clusters/") {
-		if m := clusterSegmentRegex.FindStringSubmatch(orig); len(m) >= 2 {
-			return strings.Replace(orig, "/clusters/"+m[1], prefix, 1)
-		}
-		p := prefix
-		if len(orig) > 0 && orig[len(orig)-1] == '/' {
-			p += "/"
-		}
-		return p
-	}
-	if len(orig) > 0 && orig[0] != '/' {
-		return prefix + "/" + orig
-	}
-	return prefix + orig
-}
-
-// WithDefaultClusterRoundTripper wraps cfg so that requests without a cluster
-// in context receive defaultCluster before the URL is modified.
-func WithDefaultClusterRoundTripper(cfg *rest.Config, defaultCluster string) {
-	cfg.Wrap(func(rt http.RoundTripper) http.RoundTripper {
-		return &defaultClusterRoundTripper{delegate: rt, cluster: defaultCluster}
-	})
-}
-
-type defaultClusterRoundTripper struct {
-	delegate http.RoundTripper
-	cluster  string
-}
-
-func (r *defaultClusterRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if ClusterFromContext(req.Context()) == "" {
-		req = req.WithContext(WithClusterInContext(req.Context(), r.cluster))
 	}
 	return r.delegate.RoundTrip(req)
 }

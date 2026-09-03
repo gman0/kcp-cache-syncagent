@@ -26,20 +26,18 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/gman0/kcp-cache-syncagent/internal/clusters"
 	"github.com/gman0/kcp-cache-syncagent/internal/controller/authoritativeshardregistry"
 	"github.com/gman0/kcp-cache-syncagent/internal/controller/resourcereplication/replication"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
 	mccontroller "sigs.k8s.io/multicluster-runtime/pkg/controller"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
-	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 )
 
 // syncEntry holds the lifecycle state for a running replication controller.
@@ -61,6 +59,7 @@ type Reconciler struct {
 	// ctx is the root application context; replication controllers derive from it.
 	ctx           context.Context
 	mcMgr         mcmanager.Manager
+	localMgr      ctrl.Manager
 	shardRegistry *authoritativeshardregistry.Registry
 	log           *zap.SugaredLogger
 
@@ -82,18 +81,17 @@ func Add(
 	r := &Reconciler{
 		ctx:           ctx,
 		mcMgr:         mcMgr,
+		localMgr:      mcMgr.GetLocalManager(),
 		shardRegistry: shardRegistry,
 		log:           log.Named("crd-manager"),
 		clusters:      make(map[multicluster.ClusterName]clusterEntry),
 		syncEntries:   make(map[string]*syncEntry),
 	}
 
-	if _, err := mcbuilder.ControllerManagedBy(mcMgr).
+	if err := ctrl.NewControllerManagedBy(r.localMgr).
 		Named("crd-manager").
-		For(&apiextensionsv1.CustomResourceDefinition{},
-			mcbuilder.WithClusterFilter(clusters.IsSource),
-		).
-		Build(r); err != nil {
+		For(&apiextensionsv1.CustomResourceDefinition{}).
+		Complete(r); err != nil {
 		return err
 	}
 
@@ -104,14 +102,9 @@ func Add(
 // the builder-registered controller above.
 func (r *Reconciler) Start(_ context.Context) error { return nil }
 
-// Engage implements mcmanager.Runnable. The mc manager calls this when a
-// cluster is engaged. We only track peer clusters and forward to all running
-// replication controllers.
+// Engage implements mcmanager.Runnable. The mc manager calls this when a peer
+// cluster is engaged. We track it and forward to all running replication controllers.
 func (r *Reconciler) Engage(ctx context.Context, name multicluster.ClusterName, cl cluster.Cluster) error {
-	if !clusters.IsPeer(name, cl) {
-		return nil
-	}
-
 	r.clustersLock.Lock()
 	r.clusters[name] = clusterEntry{ctx: ctx, cl: cl}
 	r.clustersLock.Unlock()
@@ -148,14 +141,9 @@ func (r *Reconciler) engagedClusterNames() []multicluster.ClusterName {
 	return names
 }
 
-func (r *Reconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (reconcile.Result, error) {
-	sourceCl, err := r.mcMgr.GetCluster(ctx, req.ClusterName)
-	if err != nil {
-		return reconcile.Result{}, fmt.Errorf("getting cluster %q: %w", req.ClusterName, err)
-	}
-
+func (r *Reconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	crd := &apiextensionsv1.CustomResourceDefinition{}
-	if err := sourceCl.GetClient().Get(ctx, req.NamespacedName, crd); err != nil {
+	if err := r.localMgr.GetClient().Get(ctx, req.NamespacedName, crd); err != nil {
 		if apierrors.IsNotFound(err) {
 			return reconcile.Result{}, r.cleanupController(req.Name)
 		}
@@ -184,16 +172,12 @@ func (r *Reconciler) ensureReplicationController(crd *apiextensionsv1.CustomReso
 		return fmt.Errorf("determining GVR/GVK for CRD %q: %w", crd.Name, err)
 	}
 
-	sourceCl, err := r.mcMgr.GetCluster(r.ctx, clusters.SourceCluster)
-	if err != nil {
-		return fmt.Errorf("getting source cluster: %w", err)
-	}
-
 	ctrlCtx, ctrlCancel := context.WithCancelCause(r.ctx)
 
 	ctrl, err := replication.Create(
 		ctrlCtx,
-		sourceCl,
+		r.localMgr.GetClient(),
+		r.localMgr.GetCache(),
 		r.mcMgr,
 		gvr,
 		gvk,

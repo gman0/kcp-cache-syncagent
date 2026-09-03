@@ -29,8 +29,8 @@ import (
 
 	kcpcorev1alpha1 "github.com/kcp-dev/sdk/apis/core/v1alpha1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/rest"
 	toolscache "k8s.io/client-go/tools/cache"
+	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
@@ -40,10 +40,15 @@ import (
 var _ multicluster.Provider = &Provider{}
 var _ multicluster.ProviderRunnable = &Provider{}
 
+// localManagerGetter is satisfied by the MCR manager; used to retrieve the
+// local controller-runtime manager without importing the mcmanager package.
+type localManagerGetter interface {
+	GetLocalManager() ctrl.Manager
+}
+
 // Provider implements multicluster.Provider and multicluster.ProviderRunnable.
 // It discovers peer cache-servers by watching Cache objects on the source.
 type Provider struct {
-	sourceConfig    *rest.Config
 	sourceURL       string
 	initialPeerURLs []string
 	caFile          string
@@ -63,7 +68,6 @@ type peerEntry struct {
 
 // New creates a Provider.
 func New(
-	sourceConfig *rest.Config,
 	sourceURL string,
 	initialPeerURLs []string,
 	caFile, certFile, keyFile string,
@@ -75,7 +79,6 @@ func New(
 	}
 
 	return &Provider{
-		sourceConfig:    sourceConfig,
 		sourceURL:       sourceURL,
 		initialPeerURLs: initialPeerURLs,
 		caFile:          caFile,
@@ -89,6 +92,12 @@ func New(
 
 // Start implements multicluster.ProviderRunnable.
 func (p *Provider) Start(ctx context.Context, aware multicluster.Aware) error {
+	localMgrGetter, ok := aware.(localManagerGetter)
+	if !ok {
+		return fmt.Errorf("aware does not implement localManagerGetter (unexpected type %T)", aware)
+	}
+	localMgr := localMgrGetter.GetLocalManager()
+
 	// Seed from initial peer URLs before starting the ongoing watch.
 	for _, url := range p.initialPeerURLs {
 		if err := p.seedFromPeer(ctx, aware, url); err != nil {
@@ -96,15 +105,10 @@ func (p *Provider) Start(ctx context.Context, aware multicluster.Aware) error {
 		}
 	}
 
-	// Build a controller-runtime cache for watching Cache objects on the source.
-	sourceCache, err := ctrlcache.New(p.sourceConfig, ctrlcache.Options{
-		Scheme: p.scheme,
-	})
-	if err != nil {
-		return fmt.Errorf("creating source cache: %w", err)
-	}
-
-	informer, err := sourceCache.GetInformer(ctx, &kcpcorev1alpha1.Cache{}, ctrlcache.BlockUntilSynced(false))
+	// Use the local manager's shared cache to watch Cache objects on the source.
+	// The MCR framework starts the local cache before running ProviderRunnable,
+	// so GetInformer is safe to call here.
+	informer, err := localMgr.GetCache().GetInformer(ctx, &kcpcorev1alpha1.Cache{}, ctrlcache.BlockUntilSynced(false))
 	if err != nil {
 		return fmt.Errorf("getting Cache informer: %w", err)
 	}
@@ -154,12 +158,13 @@ func (p *Provider) Start(ctx context.Context, aware multicluster.Aware) error {
 		}
 	}()
 
-	return sourceCache.Start(ctx)
+	<-ctx.Done()
+	return nil
 }
 
 // seedFromPeer lists Cache objects on peerURL and engages each discovered peer.
 func (p *Provider) seedFromPeer(ctx context.Context, aware multicluster.Aware, peerURL string) error {
-	peerConfig, err := cacheclient.BuildConfig(peerURL, p.caFile, p.certFile, p.keyFile)
+	peerConfig, err := cacheclient.BuildKcpConfig(peerURL, p.caFile, p.certFile, p.keyFile)
 	if err != nil {
 		return fmt.Errorf("building peer config for %s: %w", peerURL, err)
 	}
@@ -203,7 +208,7 @@ func (p *Provider) engageCacheObject(ctx context.Context, aware multicluster.Awa
 		return nil
 	}
 
-	peerConfig, err := cacheclient.BuildConfig(baseURL, p.caFile, p.certFile, p.keyFile)
+	peerConfig, err := cacheclient.BuildKcpConfig(baseURL, p.caFile, p.certFile, p.keyFile)
 	if err != nil {
 		return fmt.Errorf("building config for peer %q: %w", peerName, err)
 	}

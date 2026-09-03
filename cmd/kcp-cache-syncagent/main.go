@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	golog "log"
+	"net/http"
 	"time"
 
 	"github.com/go-logr/zapr"
@@ -29,12 +30,10 @@ import (
 
 	cacheclient "github.com/gman0/kcp-cache-syncagent/internal/client"
 	kshard "github.com/gman0/kcp-cache-syncagent/internal/client/shard"
-	"github.com/gman0/kcp-cache-syncagent/internal/clusters"
 	"github.com/gman0/kcp-cache-syncagent/internal/controller/authoritativeshardregistry"
 	resourcereplication "github.com/gman0/kcp-cache-syncagent/internal/controller/resourcereplication"
 	syncagentlog "github.com/gman0/kcp-cache-syncagent/internal/log"
 	"github.com/gman0/kcp-cache-syncagent/internal/peerprovider"
-	"github.com/gman0/kcp-cache-syncagent/internal/sourceprovider"
 	"github.com/gman0/kcp-cache-syncagent/internal/version"
 
 	kcpcrypto "github.com/kcp-dev/apimachinery/v2/pkg/util/crypto"
@@ -43,17 +42,15 @@ import (
 	kcpclientset "github.com/kcp-dev/sdk/client/clientset/versioned/cluster"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	ctrlruntimelog "sigs.k8s.io/controller-runtime/pkg/log"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
-	multiprovider "sigs.k8s.io/multicluster-runtime/providers/multi"
 )
 
 func main() {
@@ -92,39 +89,18 @@ func run(ctx context.Context, log *zap.SugaredLogger, opts *Options) error {
 		return fmt.Errorf("registering kcp core scheme: %w", err)
 	}
 
-	// Setup client configs.
-
-	localRestConfig := ctrl.GetConfigOrDie()
-	if opts.KubeconfigHostOverride != "" {
-		localRestConfig.Host = opts.KubeconfigHostOverride
-	}
-	if opts.KubeconfigCAFileOverride != "" {
-		if len(localRestConfig.TLSClientConfig.CAData) > 0 {
-			localRestConfig.TLSClientConfig.CAData = nil
-		}
-		localRestConfig.TLSClientConfig.CAFile = opts.KubeconfigCAFileOverride
-	}
-
-	sourceRestConfig, err := cacheclient.BuildConfig(opts.SourceURL,
+	sourceRestConfig, err := cacheclient.BuildKcpConfig(opts.SourceURL,
 		opts.CacheClientCAFile,
 		opts.CacheClientCertFile,
 		opts.CacheClientKeyFile,
 	)
+	sourceRestConfig.UserAgent = "x-kcp-cache-syncagent"
 	if err != nil {
 		return fmt.Errorf("building source cache server REST config: %w", err)
 	}
 
-	// Source cluster: lightweight cache+client against the source cache-server.
-	sourceCluster, err := cluster.New(sourceRestConfig, func(o *cluster.Options) {
-		o.Scheme = scheme
-	})
-	if err != nil {
-		return fmt.Errorf("creating source cluster: %w", err)
-	}
-
 	// Peer discovery provider: watches Cache objects on the source for peers.
-	peerDiscoveryProvider, err := peerprovider.New(
-		sourceRestConfig,
+	peerProvider, err := peerprovider.New(
 		opts.SourceURL,
 		opts.InitialPeerURLs,
 		opts.CacheClientCAFile,
@@ -136,20 +112,13 @@ func run(ctx context.Context, log *zap.SugaredLogger, opts *Options) error {
 		return fmt.Errorf("creating peer discovery provider: %w", err)
 	}
 
-	// Multi provider: aggregates source and peer providers under named prefixes.
-	multiProv := multiprovider.New(multiprovider.Options{})
-	if err := multiProv.AddProvider(clusters.SourceProviderName, sourceprovider.New(sourceCluster, log)); err != nil {
-		return fmt.Errorf("adding source provider: %w", err)
-	}
-	if err := multiProv.AddProvider(clusters.PeersProviderName, peerDiscoveryProvider); err != nil {
-		return fmt.Errorf("adding peers provider: %w", err)
-	}
-
-	// Multicluster manager: runs on local cluster for leader election and
-	// routes cluster Engage calls via the multi provider.
+	// The multicluster manager runs against the source cache-server as its local
+	// cluster. Controllers that watch the source use the manager's built-in
+	// client/cache directly; the peer provider engages peer cache-servers as
+	// named clusters via Engage.
 	leaderElectionIDSuffixHash := sha256.Sum224([]byte(opts.SourceURL))
 	leaderElectionIDSuffix := kcpcrypto.Base36.BytesPad(leaderElectionIDSuffixHash[:])[8:]
-	mgr, err := mcmanager.New(localRestConfig, multiProv, ctrl.Options{
+	ctrlOpts := ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
 			BindAddress: opts.MetricsAddr,
@@ -160,7 +129,27 @@ func run(ctx context.Context, log *zap.SugaredLogger, opts *Options) error {
 		LeaderElectionID:              "kcp-cache-syncagent-" + leaderElectionIDSuffix,
 		LeaderElectionNamespace:       opts.Namespace,
 		LeaderElectionReleaseOnCancel: true,
-	})
+	}
+	if opts.EnableLeaderElection {
+		leaderElectionConfig, err := ctrl.GetConfig()
+		if err != nil {
+			return fmt.Errorf("loading leader election kubeconfig: %w", err)
+		}
+		ctrlOpts.LeaderElectionConfig = leaderElectionConfig
+	}
+
+	// The cache-server is not a standard Kubernetes cluster and does not serve
+	// standard discovery endpoints (/api, /apis). Provide a static REST mapper
+	// so controller-runtime doesn't attempt discovery at startup.
+	ctrlOpts.MapperProvider = func(_ *rest.Config, _ *http.Client) (meta.RESTMapper, error) {
+		m := meta.NewDefaultRESTMapper(nil)
+		m.Add(kcpcorev1alpha1.SchemeGroupVersion.WithKind("Shard"), meta.RESTScopeRoot)
+		m.Add(kcpcorev1alpha1.SchemeGroupVersion.WithKind("Cache"), meta.RESTScopeRoot)
+		m.Add(apiextensionsv1.SchemeGroupVersion.WithKind("CustomResourceDefinition"), meta.RESTScopeRoot)
+		return m, nil
+	}
+
+	mgr, err := mcmanager.New(sourceRestConfig, peerProvider, ctrlOpts)
 	if err != nil {
 		return fmt.Errorf("creating multicluster manager: %w", err)
 	}
@@ -189,7 +178,7 @@ func run(ctx context.Context, log *zap.SugaredLogger, opts *Options) error {
 	log.Infow("Resolved own cache-server name", "name", ownName)
 
 	// Authoritative shard tracker: watches Shard objects on the source cluster.
-	shardRegistry, err := authoritativeshardregistry.Add(mgr, ownName, log)
+	shardRegistry, err := authoritativeshardregistry.Add(mgr.GetLocalManager(), ownName, log)
 	if err != nil {
 		return fmt.Errorf("setting up shard registry: %w", err)
 	}
@@ -219,10 +208,4 @@ func resolveOwnName(ctx context.Context, sourceClient kcpclientset.ClusterInterf
 	}
 
 	return "", fmt.Errorf("could not identify own Cache object in system:cache:server/system:cache (found %d objects)", len(list.Items))
-}
-
-func loadKubeconfig(filename string) (*rest.Config, error) {
-	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
-	loadingRules.ExplicitPath = filename
-	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, nil).ClientConfig()
 }

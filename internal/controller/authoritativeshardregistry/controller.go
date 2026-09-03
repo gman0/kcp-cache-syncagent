@@ -19,24 +19,22 @@ package authoritativeshardregistry
 
 import (
 	"context"
-	"fmt"
 	"sync"
 
 	"go.uber.org/zap"
 
 	kshard "github.com/gman0/kcp-cache-syncagent/internal/client/shard"
-	"github.com/gman0/kcp-cache-syncagent/internal/clusters"
 
 	"github.com/kcp-dev/logicalcluster/v3"
 	kcpcorev1alpha1 "github.com/kcp-dev/sdk/apis/core/v1alpha1"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
-	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
-	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 )
 
 const (
@@ -54,20 +52,21 @@ const (
 // kcp.io/cache annotation equals ownName).
 type Registry struct {
 	ownName string
+	client  ctrlclient.Client
 	log     *zap.SugaredLogger
-	mcMgr   mcmanager.Manager
 
 	mu       sync.RWMutex
 	shardSet map[kshard.Name]struct{}
 }
 
 // Add registers the shard registry controller with mgr and returns the Registry.
-// The controller watches Shard objects only on the source cache-server cluster.
-func Add(mgr mcmanager.Manager, ownName string, log *zap.SugaredLogger) (*Registry, error) {
+// The controller watches Shard objects on the source cache-server (the manager's
+// local cluster).
+func Add(mgr ctrl.Manager, ownName string, log *zap.SugaredLogger) (*Registry, error) {
 	t := &Registry{
 		ownName:  ownName,
+		client:   mgr.GetClient(),
 		log:      log.Named("shard-registry"),
-		mcMgr:    mgr,
 		shardSet: make(map[kshard.Name]struct{}),
 	}
 
@@ -88,12 +87,9 @@ func Add(mgr mcmanager.Manager, ownName string, log *zap.SugaredLogger) (*Regist
 		},
 	}
 
-	if err := mcbuilder.ControllerManagedBy(mgr).
+	if err := ctrl.NewControllerManagedBy(mgr).
 		Named("shard-tracker").
-		For(&kcpcorev1alpha1.Shard{},
-			mcbuilder.WithPredicates(inSystemShard),
-			mcbuilder.WithClusterFilter(clusters.IsSource),
-		).
+		For(&kcpcorev1alpha1.Shard{}, builder.WithPredicates(inSystemShard)).
 		Complete(t); err != nil {
 		return nil, err
 	}
@@ -101,15 +97,10 @@ func Add(mgr mcmanager.Manager, ownName string, log *zap.SugaredLogger) (*Regist
 	return t, nil
 }
 
-// Reconcile implements reconcile.TypedReconciler[mcreconcile.Request].
-func (t *Registry) Reconcile(ctx context.Context, req mcreconcile.Request) (reconcile.Result, error) {
-	sourceCl, err := t.mcMgr.GetCluster(ctx, req.ClusterName)
-	if err != nil {
-		return reconcile.Result{}, fmt.Errorf("getting cluster %q: %w", req.ClusterName, err)
-	}
-
+// Reconcile implements reconcile.Reconciler.
+func (t *Registry) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	shard := &kcpcorev1alpha1.Shard{}
-	if err := sourceCl.GetClient().Get(ctx, req.NamespacedName, shard); err != nil {
+	if err := t.client.Get(ctx, req.NamespacedName, shard); err != nil {
 		if apierrors.IsNotFound(err) {
 			t.remove(kshard.New(req.Name))
 			return reconcile.Result{}, nil
