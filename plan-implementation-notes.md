@@ -1,5 +1,7 @@
 # Implementation notes
 
+(outdated)
+
 Cross-reference with plan-data-sync-mechanism.md (variant A).
 
 ## Relationship to kcp-api-syncagent

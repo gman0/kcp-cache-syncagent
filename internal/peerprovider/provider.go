@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package peer provides the peer cache-server machinery.
-package peer
+package peerprovider
 
 import (
 	"context"
@@ -28,9 +28,9 @@ import (
 	cacheclient "github.com/gman0/kcp-cache-syncagent/internal/client"
 
 	kcpcorev1alpha1 "github.com/kcp-dev/sdk/apis/core/v1alpha1"
-	toolscache "k8s.io/client-go/tools/cache"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
+	toolscache "k8s.io/client-go/tools/cache"
 	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"

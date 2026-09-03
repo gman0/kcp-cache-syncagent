@@ -86,8 +86,8 @@ func (o *Options) AddFlags(flags *pflag.FlagSet) {
 		"URL of the source cache-server to replicate from")
 	flags.StringSliceVar(&o.InitialPeerURLs, "initial-peer-urls", o.InitialPeerURLs,
 		"comma-separated list of peer cache-server URLs used to bootstrap the peer mesh (optional)")
-	flags.StringVar(&o.LeaderElectionKubeconfig, "leader-election-kubeconfig", o.LeaderElectionKubeconfig,
-		"kubeconfig for a Kubernetes cluster used to store leader-election leases; if unset, leader election is disabled")
+	flags.BoolVar(&o.EnableLeaderElection, "enable-leader-election", o.EnableLeaderElection,
+		"whether to perform leader election")
 	flags.StringVar(&o.Namespace, "namespace", o.Namespace,
 		"Kubernetes namespace for leader-election leases (only used with --leader-election-kubeconfig)")
 	flags.StringVar(&o.MetricsAddr, "metrics-address", o.MetricsAddr,
@@ -114,7 +114,7 @@ func (o *Options) Validate() error {
 	if o.SourceURL == "" {
 		errs = append(errs, errors.New("--source-url is required"))
 	}
-	if o.LeaderElectionKubeconfig != "" && o.Namespace == "" {
+	if o.EnableLeaderElection && o.Namespace == "" {
 		errs = append(errs, errors.New("--namespace is required when --leader-election-kubeconfig is set"))
 	}
 

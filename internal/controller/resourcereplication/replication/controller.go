@@ -26,8 +26,8 @@ import (
 
 	cacheclient "github.com/gman0/kcp-cache-syncagent/internal/client"
 	kshard "github.com/gman0/kcp-cache-syncagent/internal/client/shard"
-	shardtracker "github.com/gman0/kcp-cache-syncagent/internal/controller/shard"
-	dynmanager "github.com/gman0/kcp-cache-syncagent/internal/manager"
+	"github.com/gman0/kcp-cache-syncagent/internal/clusters"
+	"github.com/gman0/kcp-cache-syncagent/internal/controller/authoritativeshardregistry"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -35,14 +35,15 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 	mccontroller "sigs.k8s.io/multicluster-runtime/pkg/controller"
 	mchandler "sigs.k8s.io/multicluster-runtime/pkg/handler"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 	mcsource "sigs.k8s.io/multicluster-runtime/pkg/source"
 )
@@ -51,30 +52,33 @@ import (
 // cache-server to the peer cache-server identified by req.ClusterName.
 type Reconciler struct {
 	sourceClient  ctrlclient.Client
-	remoteManager mcmanager.Manager
-	tracker       *shardtracker.Tracker
+	mcMgr         mcmanager.Manager
+	shardRegistry *authoritativeshardregistry.Registry
 	gvk           schema.GroupVersionKind
 	log           *zap.SugaredLogger
 }
 
-// Create creates a new unmanaged replication controller. The caller is
-// responsible for starting it (via DynamicMultiClusterManager.StartController).
+// Create builds a new unmanaged replication controller. The caller
+// (crdmanager) is responsible for pre-seeding it with known peers and starting it.
+//
+// getPeers returns the current set of engaged peer cluster names and is called
+// inside the source-watch event mapper to fan out one reconcile request per peer.
 func Create(
 	ctx context.Context,
-	sourceManager manager.Manager,
-	remoteManager mcmanager.Manager,
+	sourceCl cluster.Cluster,
+	mcMgr mcmanager.Manager,
 	gvr schema.GroupVersionResource,
 	gvk schema.GroupVersionKind,
-	tracker *shardtracker.Tracker,
-	dmcm *dynmanager.DynamicMultiClusterManager,
+	shardRegistry *authoritativeshardregistry.Registry,
+	getPeers func() []multicluster.ClusterName,
 	log *zap.SugaredLogger,
 ) (mccontroller.Controller, error) {
 	log = log.Named("replication").With("gvr", gvr)
 
 	r := &Reconciler{
-		sourceClient:  sourceManager.GetClient(),
-		remoteManager: remoteManager,
-		tracker:       tracker,
+		sourceClient:  sourceCl.GetClient(),
+		mcMgr:         mcMgr,
+		shardRegistry: shardRegistry,
 		gvk:           gvk,
 		log:           log,
 	}
@@ -87,7 +91,7 @@ func Create(
 
 	c, err := mccontroller.NewUnmanaged(
 		fmt.Sprintf("replication-%s.%s", gvr.Resource, gvr.Group),
-		remoteManager,
+		mcMgr,
 		mccontroller.Options{
 			Reconciler:         r,
 			SkipNameValidation: ptr.To(true),
@@ -101,17 +105,16 @@ func Create(
 	// Watch each peer cluster to detect and correct drift.
 	if err := c.MultiClusterWatch(mcsource.TypedKind(peerDummy,
 		mchandler.TypedEnqueueRequestForObject[*unstructured.Unstructured](),
-	)); err != nil {
+	).WithClusterFilter(clusters.IsPeer)); err != nil {
 		return nil, fmt.Errorf("setting up peer watch: %w", err)
 	}
 
-	// Watch the source cache and fan out one reconcile request per engaged peer
-	// so that source changes are propagated to all peers.
+	// Watch the source cache and fan out one reconcile request per engaged peer.
 	authoritativeShard := predicate.NewTypedPredicateFuncs(func(u *unstructured.Unstructured) bool {
-		return tracker.IsAuthoritative(kshard.New(u.GetAnnotations()[kshard.AnnotationKey]))
+		return shardRegistry.IsAuthoritative(kshard.New(u.GetAnnotations()[kshard.AnnotationKey]))
 	})
 	enqueueAllPeers := handler.TypedEnqueueRequestsFromMapFunc(func(_ context.Context, obj *unstructured.Unstructured) []mcreconcile.Request {
-		peers := dmcm.EngagedClusters()
+		peers := getPeers()
 		reqs := make([]mcreconcile.Request, 0, len(peers))
 		for _, name := range peers {
 			reqs = append(reqs, mcreconcile.Request{
@@ -121,7 +124,7 @@ func Create(
 		}
 		return reqs
 	})
-	if err := c.Watch(source.TypedKind(sourceManager.GetCache(), sourceDummy, enqueueAllPeers, authoritativeShard)); err != nil {
+	if err := c.Watch(source.TypedKind(sourceCl.GetCache(), sourceDummy, enqueueAllPeers, authoritativeShard)); err != nil {
 		return nil, fmt.Errorf("setting up source watch: %w", err)
 	}
 
@@ -129,7 +132,7 @@ func Create(
 }
 
 func (r *Reconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (reconcile.Result, error) {
-	peerCluster, err := r.remoteManager.GetCluster(ctx, req.ClusterName)
+	peerCluster, err := r.mcMgr.GetCluster(ctx, req.ClusterName)
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("getting peer cluster %q: %w", req.ClusterName, err)
 	}
@@ -193,7 +196,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (re
 }
 
 func (r *Reconciler) isAuthoritative(obj *unstructured.Unstructured) bool {
-	return r.tracker.IsAuthoritative(kshard.New(obj.GetAnnotations()[kshard.AnnotationKey]))
+	return r.shardRegistry.IsAuthoritative(kshard.New(obj.GetAnnotations()[kshard.AnnotationKey]))
 }
 
 // objectsMatch returns true if source and peer have equivalent spec and labels.

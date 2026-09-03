@@ -29,31 +29,32 @@ import (
 
 	cacheclient "github.com/gman0/kcp-cache-syncagent/internal/client"
 	kshard "github.com/gman0/kcp-cache-syncagent/internal/client/shard"
-	"github.com/gman0/kcp-cache-syncagent/internal/controller/crdmanager"
-	shardtracker "github.com/gman0/kcp-cache-syncagent/internal/controller/shard"
+	"github.com/gman0/kcp-cache-syncagent/internal/clusters"
+	"github.com/gman0/kcp-cache-syncagent/internal/controller/authoritativeshardregistry"
+	resourcereplication "github.com/gman0/kcp-cache-syncagent/internal/controller/resourcereplication"
 	syncagentlog "github.com/gman0/kcp-cache-syncagent/internal/log"
-	dynmanager "github.com/gman0/kcp-cache-syncagent/internal/manager"
-	"github.com/gman0/kcp-cache-syncagent/internal/peer"
+	"github.com/gman0/kcp-cache-syncagent/internal/peerprovider"
+	"github.com/gman0/kcp-cache-syncagent/internal/sourceprovider"
 	"github.com/gman0/kcp-cache-syncagent/internal/version"
 
 	kcpcrypto "github.com/kcp-dev/apimachinery/v2/pkg/util/crypto"
 	"github.com/kcp-dev/logicalcluster/v3"
 	kcpcorev1alpha1 "github.com/kcp-dev/sdk/apis/core/v1alpha1"
 	kcpclientset "github.com/kcp-dev/sdk/client/clientset/versioned/cluster"
-	kcpinformers "github.com/kcp-dev/sdk/client/informers/externalversions"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	ctrlruntimelog "sigs.k8s.io/controller-runtime/pkg/log"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+	multiprovider "sigs.k8s.io/multicluster-runtime/providers/multi"
 )
-
-const resyncPeriod = 10 * time.Hour
 
 func main() {
 	ctx := context.Background()
@@ -113,8 +114,16 @@ func run(ctx context.Context, log *zap.SugaredLogger, opts *Options) error {
 		return fmt.Errorf("building source cache server REST config: %w", err)
 	}
 
+	// Source cluster: lightweight cache+client against the source cache-server.
+	sourceCluster, err := cluster.New(sourceRestConfig, func(o *cluster.Options) {
+		o.Scheme = scheme
+	})
+	if err != nil {
+		return fmt.Errorf("creating source cluster: %w", err)
+	}
+
 	// Peer discovery provider: watches Cache objects on the source for peers.
-	peerDiscoveryProvider, err := peer.New(
+	peerDiscoveryProvider, err := peerprovider.New(
 		sourceRestConfig,
 		opts.SourceURL,
 		opts.InitialPeerURLs,
@@ -127,11 +136,20 @@ func run(ctx context.Context, log *zap.SugaredLogger, opts *Options) error {
 		return fmt.Errorf("creating peer discovery provider: %w", err)
 	}
 
-	// Main multicluster manager: runs on local cluster for leader election,
-	// uses the peer discovery provider for peer coordination.
+	// Multi provider: aggregates source and peer providers under named prefixes.
+	multiProv := multiprovider.New(multiprovider.Options{})
+	if err := multiProv.AddProvider(clusters.SourceProviderName, sourceprovider.New(sourceCluster, log)); err != nil {
+		return fmt.Errorf("adding source provider: %w", err)
+	}
+	if err := multiProv.AddProvider(clusters.PeersProviderName, peerDiscoveryProvider); err != nil {
+		return fmt.Errorf("adding peers provider: %w", err)
+	}
+
+	// Multicluster manager: runs on local cluster for leader election and
+	// routes cluster Engage calls via the multi provider.
 	leaderElectionIDSuffixHash := sha256.Sum224([]byte(opts.SourceURL))
 	leaderElectionIDSuffix := kcpcrypto.Base36.BytesPad(leaderElectionIDSuffixHash[:])[8:]
-	mgr, err := mcmanager.New(localRestConfig, peerDiscoveryProvider, ctrl.Options{
+	mgr, err := mcmanager.New(localRestConfig, multiProv, ctrl.Options{
 		Scheme: scheme,
 		Metrics: metricsserver.Options{
 			BindAddress: opts.MetricsAddr,
@@ -147,66 +165,43 @@ func run(ctx context.Context, log *zap.SugaredLogger, opts *Options) error {
 		return fmt.Errorf("creating multicluster manager: %w", err)
 	}
 
-	// DynamicMultiClusterManager wraps the mc manager to allow controllers to
-	// be started dynamically (one per CRD) and pre-seeded with known peers.
-	dmcm, err := dynmanager.New(mgr)
+	// Build a kcpclientset against the source for own-name resolution
+	// (requires cross-shard access via the kcp client).
+	sourceKcpClient, err := kcpclientset.NewForConfig(sourceRestConfig)
 	if err != nil {
-		return fmt.Errorf("creating dynamic multicluster manager: %w", err)
+		return fmt.Errorf("creating source kcp client: %w", err)
 	}
-
-	// Source manager: controller-runtime manager pointed at the source
-	// cache-server. CRD and Shard controllers register here.
-	sourceMgr, err := ctrl.NewManager(sourceRestConfig, ctrl.Options{
-		Scheme: scheme,
-		Metrics: metricsserver.Options{
-			BindAddress: "0", // metrics are served by the main manager
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("creating source manager: %w", err)
-	}
-
-	// Add the source manager as a runnable so it starts with the main manager.
-	if err := mgr.GetLocalManager().Add(sourceMgr); err != nil {
-		return fmt.Errorf("adding source manager: %w", err)
-	}
-
-	// Build a kcpclientset against the source for peer discovery informers and
-	// own-name resolution (requires cross-shard access via the kcp client).
-	sourceClient, err := kcpclientset.NewForConfig(sourceRestConfig)
-	if err != nil {
-		return fmt.Errorf("creating source client: %w", err)
-	}
-	sourceKcpSharedInformerFactory := kcpinformers.NewSharedInformerFactoryWithOptions(
-		sourceClient,
-		resyncPeriod,
-	)
-
-	log.Info("Starting source informers")
-	go sourceKcpSharedInformerFactory.Core().V1alpha1().Caches().Informer().RunWithContext(ctx)
-	go sourceKcpSharedInformerFactory.Core().V1alpha1().Shards().Informer().RunWithContext(ctx)
-	sourceKcpSharedInformerFactory.Start(ctx.Done())
 
 	// Resolve own cache-server name from the source before the manager starts.
-	ownName, err := resolveOwnName(ctx, sourceClient)
-	if err != nil {
-		return fmt.Errorf("resolving own cache-server name: %w", err)
+	log.Info("Retrieve source cache-server info")
+	var ownName string
+	if err := wait.PollUntilContextCancel(ctx, time.Second, true, func(ctx context.Context) (bool, error) {
+		ownName, err = resolveOwnName(ctx, sourceKcpClient)
+		if err != nil {
+			log.Errorf("resolving own cache-server name: %w", err)
+			return false, nil
+		}
+		return true, nil
+	}); err != nil {
+		log.Error(err, "failed to retrieve source cache-server info")
+		return nil // don't klog.Fatal. This only happens when context is cancelled.
 	}
 	log.Infow("Resolved own cache-server name", "name", ownName)
 
-	// Authoritative shard tracker: watches Shard objects on the source.
-	tracker, err := shardtracker.Add(sourceMgr, ownName, log)
+	// Authoritative shard tracker: watches Shard objects on the source cluster.
+	shardRegistry, err := authoritativeshardregistry.Add(mgr, ownName, log)
 	if err != nil {
-		return fmt.Errorf("setting up shard tracker: %w", err)
+		return fmt.Errorf("setting up shard registry: %w", err)
 	}
 
-	// CRD manager: watches CRDs and starts/stops replication controllers.
-	if err := crdmanager.Add(ctx, sourceMgr, dmcm, tracker, log); err != nil {
+	// CRD manager: watches CRDs on the source, starts/stops replication
+	// controllers, and receives peer Engage calls from the mc manager.
+	if err := resourcereplication.Add(ctx, mgr, shardRegistry, log); err != nil {
 		return fmt.Errorf("adding CRD manager: %w", err)
 	}
 
 	log.Info("Starting kcp cache-syncagent…")
-	return dmcm.Start(ctx)
+	return mgr.Start(ctx)
 }
 
 // resolveOwnName reads the self-identifying Cache object from
